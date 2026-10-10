@@ -39,6 +39,74 @@ class TestWowsStrategyV2(unittest.TestCase):
         if "SQLITE_DB_PATH" in os.environ:
             del os.environ["SQLITE_DB_PATH"]
 
+    def test_strategy_attributes_and_interface_version(self):
+        """
+        Validates Freqtrade container contract attributes.
+        """
+        self.assertEqual(self.strategy.INTERFACE_VERSION, 3)
+        self.assertEqual(self.strategy.timeframe, "1h")
+        self.assertEqual(self.strategy.inf_timeframe, "4h")
+        self.assertEqual(self.strategy.stoploss, -0.04)
+        self.assertFalse(self.strategy.can_short)
+        self.assertTrue(self.strategy.process_only_new_candles)
+        self.assertEqual(self.strategy.informative_pairs(), [("BTC/USDT", "4h")])
+
+    def test_live_equity_strict_isolation_fails_closed(self):
+        """
+        Critical Test: In live mode (dry_run=False), _get_current_equity()
+        MUST NEVER fall back to dry_run_wallet or simulated config values.
+        If live wallet is missing/empty, it must fail closed (return 0.0).
+        """
+        live_config = {
+            "dry_run": False,
+            "dry_run_wallet": 50000.0,  # Simulated value present in config
+            "stake_currency": "USDT",
+        }
+        live_strategy = WowsStrategyV2(live_config)
+        # Without wallets attached, MUST return 0.0, NOT 50000.0
+        self.assertEqual(live_strategy._get_current_equity(), 0.0)
+
+        # Attaching a verified live wallet with $25,000 returns $25,000
+        mock_wallets = MagicMock()
+        mock_wallets.get_total_stake_amount.return_value = 25000.0
+        live_strategy.wallets = mock_wallets
+        self.assertEqual(live_strategy._get_current_equity(), 25000.0)
+
+    def test_exit_path_remains_operational_when_reconciliation_fails(self):
+        """
+        Critical Test: When startup reconciliation fails, new entries are blocked
+        via confirm_trade_entry, but exits (custom_exit, populate_exit_trend)
+        must remain 100% operational.
+        """
+        self.strategy._reconciliation_passed = False
+
+        # 1. Entry is blocked
+        now = datetime.now(timezone.utc)
+        entry_allowed = self.strategy.confirm_trade_entry(
+            pair="SOL/USDT",
+            order_type="limit",
+            amount=5.0,
+            rate=150.0,
+            time_in_force="gtc",
+            current_time=now,
+            entry_tag="trend_pullback"
+        )
+        self.assertFalse(entry_allowed)
+
+        # 2. Exits remain fully operational
+        trade = MagicMock()
+        trade.enter_tag = "trend_pullback"
+        trade.open_date_utc = None
+
+        exit_reason = self.strategy.custom_exit(
+            pair="SOL/USDT",
+            trade=trade,
+            current_time=now,
+            current_rate=155.0,
+            current_profit=0.036
+        )
+        self.assertEqual(exit_reason, "profit_target")
+
     def test_backtest_isolation_no_network_or_threads(self):
         """
         P0 Test: In backtest mode, bot_start() must NOT start background
@@ -53,7 +121,6 @@ class TestWowsStrategyV2(unittest.TestCase):
         bt_strategy = WowsStrategyV2(backtest_config)
         self.assertFalse(bt_strategy.is_live_or_dryrun())
 
-        # Calling bot_start must be completely offline
         with patch.object(bt_strategy.reconciliation, "reconcile") as mock_reconcile:
             bt_strategy.bot_start()
             mock_reconcile.assert_not_called()
@@ -130,7 +197,6 @@ class TestWowsStrategyV2(unittest.TestCase):
             entry_tag="breakout",
             side="buy"
         )
-        # Capped strictly at 10% of $10,000 = $1,000.00
         self.assertEqual(stake, 1000.0)
 
     def test_custom_stake_amount_min_stake_safety_skip(self):
@@ -285,7 +351,6 @@ class TestWowsStrategyV2(unittest.TestCase):
         trade.open_date_utc = None
         now = datetime.now(timezone.utc)
 
-        # At -2.1% loss
         exit_reason = self.strategy.custom_exit(
             pair="SOL/USDT",
             trade=trade,

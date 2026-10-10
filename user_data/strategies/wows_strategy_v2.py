@@ -21,7 +21,10 @@ Core Invariants:
    - Risk fraction: 0.25% of validated equity per trade.
    - Stop distance: 4.0% initial stop + 0.5% cost/slippage allowance (4.5% total).
    - Maximum position cap: 10.0% of portfolio equity.
-   - Fails closed (returns 0.0) if reliable equity is unavailable (NO hardcoded fallbacks).
+   - Strict Live vs Dry-Run Equity Isolation:
+     * Live trading MUST use verified exchange wallet equity (`wallets.get_total_stake_amount()`).
+       Fails closed (returns 0.0) if verified live equity is unavailable. NEVER falls back to dry_run_wallet!
+     * Dry-run / backtest modes use simulated wallet equity with dry_run_wallet fallback.
    - Skips trade if calculated stake is below exchange min_stake (no silent inflation).
 7. Explicit Exit Semantics:
    - Intrabar hard maximum stop: -4.0% (`stoploss = -0.04`).
@@ -29,6 +32,7 @@ Core Invariants:
    - Intrabar breakout failure exit: -2.0% (`custom_exit: 'breakout_failure'`).
    - Elapsed time stagnation exit: 48 hours with < +0.5% profit (`custom_exit: 'time_stagnation'`).
    - Closed-candle trend exit: 2 consecutive closes below EMA 20 (`populate_exit_trend`).
+   - Exit path remains completely operational even if new entries are blocked by reconciliation or guards.
 8. Production resilience (Live/Dry-run only):
    - Durable thread-safe SQLite outbox with SHA256 integrity and stable event IDs.
    - 60-second telemetry heartbeats to WOWS backend.
@@ -393,6 +397,7 @@ class WowsStrategyV2(IStrategy):
         Freqtrade dynamic pre-trade gate.
         Called trade-by-trade immediately before order placement in both backtesting and live execution.
         Evaluates RiskGuards and reconciliation status chronologically at current_time.
+        Note: Exits are NEVER blocked here; only new entries are gated.
         """
         # 1. In live/dry-run, require healthy startup reconciliation
         if self.is_live_or_dryrun() and not self._reconciliation_passed:
@@ -420,6 +425,7 @@ class WowsStrategyV2(IStrategy):
         """
         Populates baseline trend breakdown exit.
         Requires 2 consecutive closed candles below EMA 20 (candle close confirmation).
+        Remains operational regardless of reconciliation or entry guard state.
         """
         dataframe["exit_long"] = 0
 
@@ -447,6 +453,7 @@ class WowsStrategyV2(IStrategy):
         - Fixed profit target (+3.5%) [intrabar check]
         - Breakout failure cutoff (-2.0%) [intrabar check]
         - Elapsed time stagnation (48h with < +0.5% profit)
+        Remains operational regardless of reconciliation or entry guard state.
         """
         # 1. Target Take Profit (+3.5%)
         if current_profit >= self.PROFIT_TARGET_PCT:
@@ -574,9 +581,17 @@ class WowsStrategyV2(IStrategy):
 
     def _get_current_equity(self) -> float:
         """
-        Retrieves validated current equity. Fails closed (returns 0.0) if unavailable.
-        Never assumes hardcoded fallbacks.
+        Retrieves validated current equity strictly by execution mode:
+        1. Live Mode (dry_run=False):
+           MUST strictly use verified exchange wallet equity (`self.wallets.get_total_stake_amount()`).
+           NEVER falls back to dry_run_wallet or simulated values.
+           If verified live equity is unavailable, returns 0.0 (fails closed).
+        2. Dry-Run / Backtest Mode:
+           Uses simulated wallet equity if available, or configured dry_run_wallet/available_capital.
         """
+        is_live_trading = not bool(self.config.get("dry_run", True))
+
+        # Check wallet equity first across all modes
         if hasattr(self, "wallets") and self.wallets:
             try:
                 total = float(self.wallets.get_total_stake_amount())
@@ -585,6 +600,12 @@ class WowsStrategyV2(IStrategy):
             except Exception:
                 pass
 
+        # In LIVE trading, FAIL CLOSED immediately if wallet equity is unavailable
+        if is_live_trading:
+            logger.error("Live trading mode active but verified exchange wallet equity is unavailable! Failing closed.")
+            return 0.0
+
+        # In DRY-RUN or BACKTEST modes, simulated balance fallbacks are permitted
         dry_wallet = self.config.get("dry_run_wallet")
         if dry_wallet is not None:
             try:
