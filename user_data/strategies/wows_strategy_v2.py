@@ -27,6 +27,8 @@ Core Invariants:
    - Two-tier RiskGuards (daily drawdown limit, loss streaks, per-pair cooldowns).
 """
 
+# pyright: reportMissingImports=false
+
 import os
 import json
 import time
@@ -34,35 +36,35 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
-# Graceful imports to allow execution both within Freqtrade and in standalone test environments
+# Graceful imports to allow execution both within Freqtrade container and local IDE / test environments
 try:
-    from freqtrade.strategy import IStrategy, informative, merge_informative_pair
-    from freqtrade.persistence import Trade, Order
+    from freqtrade.strategy import IStrategy, informative, merge_informative_pair  # type: ignore
+    from freqtrade.persistence import Trade, Order  # type: ignore
 except ImportError:
-    class IStrategy:
+    class IStrategy:  # type: ignore
         def __init__(self, config: dict = None) -> None:
             self.config = config or {}
-    class Trade:
+    class Trade:  # type: ignore
         pass
-    class Order:
+    class Order:  # type: ignore
         pass
-    def informative(*args, **kwargs):
+    def informative(*args, **kwargs):  # type: ignore
         def decorator(f):
             return f
         return decorator
-    def merge_informative_pair(dataframe, informative, timeframe, inf_timeframe, ffill=True):
+    def merge_informative_pair(dataframe, informative, timeframe, inf_timeframe, ffill=True):  # type: ignore
         return dataframe
 
 try:
-    from pandas import DataFrame, Series
+    from pandas import DataFrame, Series  # type: ignore
 except ImportError:
-    DataFrame = Any
-    Series = Any
+    DataFrame = Any  # type: ignore
+    Series = Any  # type: ignore
 
 try:
-    import talib.abstract as ta
+    import talib.abstract as ta  # type: ignore
 except ImportError:
-    ta = None
+    ta = None  # type: ignore
 
 import sys
 from pathlib import Path
