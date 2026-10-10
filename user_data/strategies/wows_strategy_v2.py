@@ -6,25 +6,34 @@ opportunity frequency while strictly controlling downside exposure.
 
 Core Invariants:
 1. Strictly dry_run = True, Spot long-only, Zero leverage.
-2. Multi-setup architecture:
+2. Complete Backtest / Live Isolation:
+   - Backtest & Hyperopt modes run with ZERO network calls, zero thread spawns,
+     and without dependency on external live WOWS services.
+   - Historical vectorized entry signals are purely mathematical and stateless.
+   - Stateful risk controls are evaluated trade-by-trade chronologically via
+     Freqtrade's dynamic `confirm_trade_entry()` hook.
+3. Multi-setup architecture:
    - Setup A (Trend Pullback): Enters healthy retracements in confirmed uptrends.
    - Setup B (Confirmed Breakout): Enters volatility expansions above 20-candle high.
-3. Zero lookahead bias: Breakout thresholds strictly exclude current candle via shift(1).
-4. Informative Higher Timeframe: 4h BTC EMA 50 trend confirmation filter.
-5. Volatility & Risk-Budget Position Sizing:
-   Stake = min((Equity * 0.0025) / 0.045, Equity * 0.10, Available_balance)
-   Skips trade if calculated stake is below exchange min_stake (no silent clamping).
-6. Multi-stage exits:
-   - Hard maximum stop: -4.0%
-   - Breakout failure cutoff: -2.0%
-   - Profit target: +3.5%
-   - Time stagnation: 48 hours with < +0.5% progress
-   - Trend breakdown: 2 consecutive closes below EMA 20
-7. Production resilience:
+4. Zero lookahead bias: Breakout thresholds strictly exclude current candle via shift(1).
+5. Informative Higher Timeframe: 4h BTC EMA 50 trend confirmation filter.
+6. Mathematical Risk-Budget Sizing:
+   - Risk fraction: 0.25% of validated equity per trade.
+   - Stop distance: 4.0% initial stop + 0.5% cost/slippage allowance (4.5% total).
+   - Maximum position cap: 10.0% of portfolio equity.
+   - Fails closed (returns 0.0) if reliable equity is unavailable (NO hardcoded fallbacks).
+   - Skips trade if calculated stake is below exchange min_stake (no silent inflation).
+7. Explicit Exit Semantics:
+   - Intrabar hard maximum stop: -4.0% (`stoploss = -0.04`).
+   - Intrabar dynamic target exit: +3.5% (`custom_exit: 'profit_target'`).
+   - Intrabar breakout failure exit: -2.0% (`custom_exit: 'breakout_failure'`).
+   - Elapsed time stagnation exit: 48 hours with < +0.5% profit (`custom_exit: 'time_stagnation'`).
+   - Closed-candle trend exit: 2 consecutive closes below EMA 20 (`populate_exit_trend`).
+8. Production resilience (Live/Dry-run only):
    - Durable thread-safe SQLite outbox with SHA256 integrity and stable event IDs.
    - 60-second telemetry heartbeats to WOWS backend.
-   - Startup reconciliation parity gate (blocks entries if discrepancies or quarantines exist).
-   - Two-tier RiskGuards (daily drawdown limit, loss streaks, per-pair cooldowns).
+   - Startup reconciliation parity gate (blocks live entries if discrepancies or quarantines exist).
+   - Two-tier RiskGuards (3.0% daily drawdown limit, 3 consecutive losses, 5-bar pair cooldown).
 """
 
 # pyright: reportMissingImports=false
@@ -44,6 +53,8 @@ except ImportError:
     class IStrategy:  # type: ignore
         def __init__(self, config: dict = None) -> None:
             self.config = config or {}
+            self.dp = None
+            self.wallets = None
     class Trade:  # type: ignore
         pass
     class Order:  # type: ignore
@@ -107,8 +118,8 @@ class WowsStrategyV2(IStrategy):
     RISK_FRACTION_PER_TRADE = 0.0025    # 0.25% equity risked per trade
     STOP_DISTANCE_FRACTION = 0.045      # 4.0% stop + 0.5% fee/slippage allowance
     MAX_POSITION_EQUITY_RATIO = 0.10    # 10% maximum portfolio allocation per position
-    BREAKOUT_FAILURE_LOSS_PCT = -0.02   # Exit breakout at -2% if thesis fails
-    PROFIT_TARGET_PCT = 0.035           # +3.5% take profit target
+    BREAKOUT_FAILURE_LOSS_PCT = -0.02   # Exit breakout at -2.0% if thesis fails
+    PROFIT_TARGET_PCT = 0.035           # +3.5% fixed take-profit target
     STAGNATION_HOURS = 48.0             # Exit after 48h if trade has made no progress
     STAGNATION_MIN_PROFIT = 0.005       # +0.5% minimum threshold for stagnation
 
@@ -140,7 +151,7 @@ class WowsStrategyV2(IStrategy):
         self.reconciliation = ReconciliationClient(self.wows_base_url, self.bot_api_key, self.bot_id)
         self.telemetry = TelemetryClient(self.wows_base_url, self.bot_api_key, self.bot_id, interval_sec=60.0)
         self.guards = RiskGuards(
-            max_daily_loss_pct=0.03,      # 3% daily drawdown circuit breaker
+            max_daily_loss_pct=0.03,      # 3.0% daily drawdown circuit breaker
             max_consecutive_losses=3,     # 3 consecutive losses
             cooldown_bars=5,              # 5-bar (5 hours) cooldown on losing pair
             timeframe_minutes=60,
@@ -148,17 +159,38 @@ class WowsStrategyV2(IStrategy):
 
         self._reconciliation_passed = False
 
+    def is_live_or_dryrun(self) -> bool:
+        """
+        Determines whether the strategy is executing in live/dry-run mode
+        vs historical backtesting or hyperopt.
+        """
+        if hasattr(self, "dp") and self.dp and hasattr(self.dp, "runmode"):
+            mode_val = getattr(self.dp.runmode, "value", str(self.dp.runmode)).lower()
+            return mode_val in ("live", "dry_run")
+        config_mode = str(self.config.get("runmode", "")).lower()
+        if config_mode in ("backtest", "hyperopt", "plot", "util"):
+            return False
+        return bool(self.config.get("dry_run", True))
+
     def bot_start(self, **kwargs) -> None:
-        """Freqtrade lifecycle hook: runs once when bot daemon starts."""
-        logger.info("Initializing WOWS Crypto Bot v2 (Multi-Setup)...")
+        """
+        Freqtrade lifecycle hook: runs once when bot daemon starts.
+        Enforces strict research/live separation: no network calls in backtest mode.
+        """
+        if not self.is_live_or_dryrun():
+            logger.info("Strategy running in research/backtesting mode: live external services bypassed.")
+            self._reconciliation_passed = True
+            return
+
+        logger.info("Initializing WOWS Crypto Bot v2 (Live/Dry-Run Runtime)...")
         # Start background workers
         self.dispatcher.start()
         self.telemetry.start()
 
-        # Step 1: Drain any pending fills from persistent queue
+        # Drain any pending fills from persistent queue
         self.dispatcher.process_pending_batch(limit=50)
 
-        # Step 2: Perform Startup Reconciliation against authoritative WOWS ledger
+        # Perform Startup Reconciliation against authoritative WOWS ledger
         local_trades = []
         try:
             open_trades = Trade.get_open_trades()
@@ -191,6 +223,9 @@ class WowsStrategyV2(IStrategy):
 
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
         """Runs each iteration of the bot trading loop."""
+        if not self.is_live_or_dryrun():
+            return
+
         # Memory optimization for constrained container runtimes:
         self._loop_count = getattr(self, "_loop_count", 0) + 1
         if self._loop_count % 12 == 0:
@@ -280,22 +315,10 @@ class WowsStrategyV2(IStrategy):
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
-        Populates entry signals for Setup A (Trend Pullback) and Setup B (Breakout)
-        with explicit enter_tag tagging.
+        Purely vectorized, stateless calculation of candidate entry signals for
+        Setup A (Trend Pullback) and Setup B (Breakout).
+        Stateful risk gates (guards, reconciliation) are evaluated dynamically in confirm_trade_entry().
         """
-        pair = metadata["pair"]
-        now_ms = int(time.time() * 1000)
-
-        # Pre-trade guard check: verify bot health, drawdown limits, and pair cooldown
-        current_equity = self._get_current_equity()
-        can_enter, reason, is_halt = self.guards.check_entry_allowed(pair, now_ms, current_equity)
-        if not can_enter or not self._reconciliation_passed:
-            dataframe["enter_long"] = 0
-            if reason:
-                self.telemetry.log_event("guard_blocked", "info", f"Entry suppressed on {pair}: {reason}")
-            return dataframe
-
-        # Initialize signal columns
         dataframe["enter_long"] = 0
         dataframe["enter_tag"] = None
 
@@ -355,14 +378,52 @@ class WowsStrategyV2(IStrategy):
 
         return dataframe
 
+    def confirm_trade_entry(
+        self,
+        pair: str,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        current_time: datetime,
+        entry_tag: Optional[str],
+        **kwargs
+    ) -> bool:
+        """
+        Freqtrade dynamic pre-trade gate.
+        Called trade-by-trade immediately before order placement in both backtesting and live execution.
+        Evaluates RiskGuards and reconciliation status chronologically at current_time.
+        """
+        # 1. In live/dry-run, require healthy startup reconciliation
+        if self.is_live_or_dryrun() and not self._reconciliation_passed:
+            logger.warning(f"Rejecting entry on {pair}: Startup reconciliation not passed.")
+            return False
+
+        # 2. Validate reliable equity (fail closed if unavailable)
+        current_equity = self._get_current_equity()
+        if current_equity <= 0:
+            logger.warning(f"Rejecting entry on {pair}: Validated equity unavailable ({current_equity}). Failing closed.")
+            return False
+
+        # 3. Chronological RiskGuards check at the candle's timestamp
+        timestamp_ms = int(current_time.timestamp() * 1000)
+        can_enter, reason, is_halt = self.guards.check_entry_allowed(pair, timestamp_ms, current_equity)
+        if not can_enter:
+            if self.is_live_or_dryrun() and reason:
+                self.telemetry.log_event("guard_blocked", "info", f"Entry rejected on {pair}: {reason}")
+            logger.info(f"Entry suppressed on {pair} at {current_time}: {reason}")
+            return False
+
+        return True
+
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Populates baseline trend breakdown exit.
-        Exits when candle closes below EMA 20 with confirmation from prior candle.
+        Requires 2 consecutive closed candles below EMA 20 (candle close confirmation).
         """
         dataframe["exit_long"] = 0
 
-        # Confirmed breakdown below 20 EMA
+        # Confirmed breakdown: 2 consecutive closes below 20 EMA
         trend_breakdown = (
             (dataframe["close"] < dataframe["ema20"]) &
             (dataframe["close"].shift(1) < dataframe["ema20"].shift(1)) &
@@ -383,16 +444,16 @@ class WowsStrategyV2(IStrategy):
         """
         Trade-specific dynamic exit callback.
         Enforces:
-        - Profit target (+3.5%)
-        - Breakout failure cutoff (-2.0%)
-        - Time stagnation (48h with < +0.5% profit)
+        - Fixed profit target (+3.5%) [intrabar check]
+        - Breakout failure cutoff (-2.0%) [intrabar check]
+        - Elapsed time stagnation (48h with < +0.5% profit)
         """
-        # 1. Target Take Profit
+        # 1. Target Take Profit (+3.5%)
         if current_profit >= self.PROFIT_TARGET_PCT:
             return "profit_target"
 
         # 2. Breakout Failure Protection
-        # If entered via breakout and price reverses -2%, exit before hitting 4% stoploss
+        # If entered via breakout and price reverses -2.0%, exit early before hitting -4.0% stoploss
         if trade.enter_tag == "breakout" and current_profit <= self.BREAKOUT_FAILURE_LOSS_PCT:
             return "breakout_failure"
 
@@ -420,16 +481,18 @@ class WowsStrategyV2(IStrategy):
         **kwargs
     ) -> float:
         """
-        Calculates volatility/risk-budget stake size:
+        Calculates mathematical risk-budget stake size:
         Stake = min((Equity * Risk_fraction) / Stop_distance_fraction, Position_cap, Available_balance)
 
         Invariants:
-        - Rejects trade (returns 0.0) if calculated stake is less than exchange min_stake.
+        - Fails closed (returns 0.0) if validated equity is not available.
+        - Rejects trade (returns 0.0) if calculated stake is less than exchange min_stake (no silent inflation).
         - Never exceeds 10% maximum portfolio allocation per position.
         """
         total_equity = self._get_current_equity()
         if total_equity <= 0:
-            return proposed_stake
+            logger.warning(f"Skipping stake calculation on {pair}: Validated equity unavailable ({total_equity}). Failing closed.")
+            return 0.0
 
         # Calculate risk budget
         risk_budget = total_equity * self.RISK_FRACTION_PER_TRADE  # e.g., $1000 * 0.0025 = $2.50
@@ -457,7 +520,9 @@ class WowsStrategyV2(IStrategy):
     def order_filled(self, pair: str, trade: Trade, order: Order, current_time: datetime, **kwargs) -> None:
         """
         Documented Freqtrade hook called on order fill.
-        Extracts fields via documented Order attributes and commits to SQLite outbox.
+        Extracts fields via documented Order attributes.
+        Durably commits to SQLite outbox only during live/dry-run execution.
+        Updates RiskGuards on exit fills in both backtesting and live runtimes.
         """
         filled_amount = float(order.safe_filled or 0)
         fill_price = float(order.safe_price or 0)
@@ -474,44 +539,68 @@ class WowsStrategyV2(IStrategy):
         filled_at = order.order_filled_utc or current_time
         timestamp_ms = int(filled_at.timestamp() * 1000)
 
-        payload = {
-            "botId": self.bot_id,
-            "tradeId": trade.id,
-            "orderId": order_id,
-            "eventType": event_type,
-            "isEntry": is_entry,
-            "pair": pair,
-            "side": order.ft_order_side,
-            "filledAmount": filled_amount,
-            "fillPrice": fill_price,
-            "cost": filled_cost,
-            "timestamp": timestamp_ms,
-            "strategy": self.__class__.__name__,
-            "tag": getattr(trade, "enter_tag", None) if is_entry else getattr(trade, "exit_reason", None),
-        }
-
-        # Thread-safe outbox insert (< 1ms, zero network latency on strategy loop)
-        self.outbox.record_fill(event_id, payload)
-        logger.info(f"Recorded {event_type} fill for {pair} ({order_id}) in durable outbox. Tag: {payload['tag']}")
-
-        # Update guard state on exits
+        # Update guard state on exits (applies to both backtests and live execution)
         if not is_entry:
             profit_abs = getattr(trade, "close_profit_abs", 0.0) or 0.0
             self.guards.on_trade_closed(pair, float(profit_abs), timestamp_ms)
 
-        # Log telemetry event
-        self.telemetry.log_event(
-            "order_filled",
-            "info",
-            f"Filled {order.ft_order_side} {filled_amount} {pair} @ {fill_price} [{payload['tag']}]",
-            {"tradeId": trade.id, "orderId": order_id, "tag": payload["tag"]},
-        )
+        # Live/dry-run external services integration
+        if self.is_live_or_dryrun():
+            payload = {
+                "botId": self.bot_id,
+                "tradeId": trade.id,
+                "orderId": order_id,
+                "eventType": event_type,
+                "isEntry": is_entry,
+                "pair": pair,
+                "side": order.ft_order_side,
+                "filledAmount": filled_amount,
+                "fillPrice": fill_price,
+                "cost": filled_cost,
+                "timestamp": timestamp_ms,
+                "strategy": self.__class__.__name__,
+                "tag": getattr(trade, "enter_tag", None) if is_entry else getattr(trade, "exit_reason", None),
+            }
+
+            self.outbox.record_fill(event_id, payload)
+            logger.info(f"Recorded {event_type} fill for {pair} ({order_id}) in durable outbox. Tag: {payload['tag']}")
+
+            self.telemetry.log_event(
+                "order_filled",
+                "info",
+                f"Filled {order.ft_order_side} {filled_amount} {pair} @ {fill_price} [{payload['tag']}]",
+                {"tradeId": trade.id, "orderId": order_id, "tag": payload["tag"]},
+            )
 
     def _get_current_equity(self) -> float:
-        """Helper to get current total equity from Freqtrade wallets or config."""
+        """
+        Retrieves validated current equity. Fails closed (returns 0.0) if unavailable.
+        Never assumes hardcoded fallbacks.
+        """
         if hasattr(self, "wallets") and self.wallets:
             try:
-                return float(self.wallets.get_total_stake_amount())
+                total = float(self.wallets.get_total_stake_amount())
+                if total > 0:
+                    return total
             except Exception:
                 pass
-        return float(self.config.get("dry_run_wallet", 50000.0))
+
+        dry_wallet = self.config.get("dry_run_wallet")
+        if dry_wallet is not None:
+            try:
+                val = float(dry_wallet)
+                if val > 0:
+                    return val
+            except (ValueError, TypeError):
+                pass
+
+        avail = self.config.get("available_capital")
+        if avail is not None:
+            try:
+                val = float(avail)
+                if val > 0:
+                    return val
+            except (ValueError, TypeError):
+                pass
+
+        return 0.0

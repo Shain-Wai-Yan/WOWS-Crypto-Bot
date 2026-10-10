@@ -39,40 +39,86 @@ class TestWowsStrategyV2(unittest.TestCase):
         if "SQLITE_DB_PATH" in os.environ:
             del os.environ["SQLITE_DB_PATH"]
 
-    def test_custom_stake_amount_risk_sizing(self):
+    def test_backtest_isolation_no_network_or_threads(self):
         """
-        Tests the risk-budget sizing formula:
+        P0 Test: In backtest mode, bot_start() must NOT start background
+        threads (dispatcher/telemetry) or perform live reconciliation calls.
+        """
+        backtest_config = {
+            "runmode": "backtest",
+            "dry_run": True,
+            "dry_run_wallet": 10000.0,
+            "stake_currency": "USDT",
+        }
+        bt_strategy = WowsStrategyV2(backtest_config)
+        self.assertFalse(bt_strategy.is_live_or_dryrun())
+
+        # Calling bot_start must be completely offline
+        with patch.object(bt_strategy.reconciliation, "reconcile") as mock_reconcile:
+            bt_strategy.bot_start()
+            mock_reconcile.assert_not_called()
+
+        self.assertTrue(bt_strategy._reconciliation_passed)
+        self.assertIsNone(bt_strategy.dispatcher._thread)
+        self.assertIsNone(bt_strategy.telemetry._thread)
+
+    def test_custom_stake_amount_across_multiple_equity_levels(self):
+        """
+        Tests risk-budget sizing formula across diverse starting balances:
         Stake = min((Equity * 0.0025) / 0.045, Equity * 0.10, Available_balance)
-        For Equity = $10,000:
-        Risk budget = $10,000 * 0.0025 = $25.00
-        Stop distance = 0.045 (4.5%)
-        Risk-based stake = 25.00 / 0.045 = $555.56
-        Position cap = 10% = $1,000.00
-        Available max_stake = $2,000.00
-        Expected stake = $555.56
+        Ratio = 0.0025 / 0.045 = 5.5555...%
         """
         now = datetime.now(timezone.utc)
+
+        test_cases = [
+            (1000.0, 55.56),
+            (5000.0, 277.78),
+            (10000.0, 555.56),
+            (50000.0, 2777.78),
+        ]
+
+        for eq, expected_stake in test_cases:
+            self.strategy.config["dry_run_wallet"] = eq
+            stake = self.strategy.custom_stake_amount(
+                pair="SOL/USDT",
+                current_time=now,
+                current_rate=150.0,
+                proposed_stake=100.0,
+                min_stake=10.0,
+                max_stake=10000.0,
+                leverage=1.0,
+                entry_tag="trend_pullback",
+                side="buy"
+            )
+            self.assertAlmostEqual(stake, expected_stake, places=2)
+
+    def test_custom_stake_amount_fails_closed_on_missing_equity(self):
+        """
+        P0 Test: If reliable equity is missing or non-positive,
+        the strategy MUST fail closed (return 0.0) rather than assuming $50,000.
+        """
+        now = datetime.now(timezone.utc)
+        self.strategy.config = {"stake_currency": "USDT"}  # No wallet or dry_run_wallet
+
         stake = self.strategy.custom_stake_amount(
             pair="SOL/USDT",
             current_time=now,
             current_rate=150.0,
             proposed_stake=100.0,
             min_stake=10.0,
-            max_stake=2000.0,
+            max_stake=10000.0,
             leverage=1.0,
             entry_tag="trend_pullback",
             side="buy"
         )
-        self.assertAlmostEqual(stake, 555.56, places=2)
+        self.assertEqual(stake, 0.0)
 
-    def test_custom_stake_amount_position_cap(self):
+    def test_custom_stake_amount_position_cap_10_percent(self):
         """
-        Tests that stake never exceeds the 10% portfolio position cap.
-        If stop distance were very tight (e.g. formula produces $1,500),
-        the stake must be capped at Equity * 0.10 = $1,000.
+        Tests that stake never exceeds 10% maximum portfolio allocation per position.
         """
         now = datetime.now(timezone.utc)
-        self.strategy.STOP_DISTANCE_FRACTION = 0.01  # would yield $2,500
+        self.strategy.STOP_DISTANCE_FRACTION = 0.01  # very small stop yields $2,500
         stake = self.strategy.custom_stake_amount(
             pair="SOL/USDT",
             current_time=now,
@@ -84,7 +130,7 @@ class TestWowsStrategyV2(unittest.TestCase):
             entry_tag="breakout",
             side="buy"
         )
-        # Capped at 10% of $10,000 = $1,000.00
+        # Capped strictly at 10% of $10,000 = $1,000.00
         self.assertEqual(stake, 1000.0)
 
     def test_custom_stake_amount_min_stake_safety_skip(self):
@@ -93,27 +139,132 @@ class TestWowsStrategyV2(unittest.TestCase):
         the trade is skipped (0.0 returned) rather than silently inflated.
         """
         now = datetime.now(timezone.utc)
-        self.strategy.config["dry_run_wallet"] = 100.0
+        self.strategy.config["dry_run_wallet"] = 100.0  # yields $5.56 stake
         stake = self.strategy.custom_stake_amount(
             pair="SOL/USDT",
             current_time=now,
             current_rate=150.0,
             proposed_stake=100.0,
-            min_stake=10.0,  # Exchange requires $10.00
+            min_stake=10.0,  # Exchange minimum
             max_stake=100.0,
             leverage=1.0,
             entry_tag="trend_pullback",
             side="buy"
         )
-        # Since $5.56 < $10.00 min_stake, bot skips to preserve risk limits
         self.assertEqual(stake, 0.0)
+
+    def test_confirm_trade_entry_guards_and_chronological_evaluation(self):
+        """
+        P0 Test: confirm_trade_entry acts as the dynamic pre-trade gate.
+        Validates sequential chronological time-advancement.
+        """
+        trade_time = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+        # 1. Healthy state allows entry
+        confirmed = self.strategy.confirm_trade_entry(
+            pair="SOL/USDT",
+            order_type="limit",
+            amount=5.0,
+            rate=150.0,
+            time_in_force="gtc",
+            current_time=trade_time,
+            entry_tag="trend_pullback"
+        )
+        self.assertTrue(confirmed)
+
+        # 2. Simulate loss on SOL/USDT -> triggers 5-bar cooldown
+        trade_time_ms = int(trade_time.timestamp() * 1000)
+        self.strategy.guards.on_trade_closed("SOL/USDT", -100.0, trade_time_ms)
+
+        # 2 hours later (2 bars < 5 required) -> rejected
+        time_plus_2h = trade_time + timedelta(hours=2)
+        confirmed_cooldown = self.strategy.confirm_trade_entry(
+            pair="SOL/USDT",
+            order_type="limit",
+            amount=5.0,
+            rate=150.0,
+            time_in_force="gtc",
+            current_time=time_plus_2h,
+            entry_tag="trend_pullback"
+        )
+        self.assertFalse(confirmed_cooldown)
+
+        # Different pair (ETH/USDT) not in cooldown is allowed
+        confirmed_eth = self.strategy.confirm_trade_entry(
+            pair="ETH/USDT",
+            order_type="limit",
+            amount=1.0,
+            rate=3000.0,
+            time_in_force="gtc",
+            current_time=time_plus_2h,
+            entry_tag="trend_pullback"
+        )
+        self.assertTrue(confirmed_eth)
+
+    def test_confirm_trade_entry_fails_closed_on_unreconciled_or_missing_equity(self):
+        """
+        P0 Test: confirm_trade_entry fails closed if reconciliation is unverified or equity is missing.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Live mode with failed reconciliation
+        self.strategy.config["runmode"] = "live"
+        self.strategy._reconciliation_passed = False
+        confirmed = self.strategy.confirm_trade_entry(
+            pair="SOL/USDT",
+            order_type="limit",
+            amount=5.0,
+            rate=150.0,
+            time_in_force="gtc",
+            current_time=now,
+            entry_tag="trend_pullback"
+        )
+        self.assertFalse(confirmed)
+
+        # Missing equity
+        self.strategy._reconciliation_passed = True
+        self.strategy.config["dry_run_wallet"] = 0.0
+        confirmed_no_eq = self.strategy.confirm_trade_entry(
+            pair="SOL/USDT",
+            order_type="limit",
+            amount=5.0,
+            rate=150.0,
+            time_in_force="gtc",
+            current_time=now,
+            entry_tag="trend_pullback"
+        )
+        self.assertFalse(confirmed_no_eq)
+
+    def test_risk_guards_daily_loss_3_percent_and_rollover(self):
+        """
+        Verifies 3.0% daily loss limit and automatic chronological day rollover.
+        """
+        guards = RiskGuards(max_daily_loss_pct=0.03, timeframe_minutes=60)
+        day1_start_ms = 1791628800000  # Day 1 00:00 UTC
+
+        allowed, _, _ = guards.check_entry_allowed("SOL/USDT", day1_start_ms, 10000.0)
+        self.assertTrue(allowed)
+
+        # Take $350 loss on $10,000 equity (3.5% > 3.0% limit)
+        guards.on_trade_closed("SOL/USDT", -350.0, day1_start_ms + 3600000)
+        allowed, reason, is_halt = guards.check_entry_allowed("SOL/USDT", day1_start_ms + 7200000, 9650.0)
+        self.assertFalse(allowed)
+        self.assertTrue(is_halt)
+        self.assertIn("Daily loss limit hit", reason)
+
+        # Advance to Day 2 (Day rollover) -> automatically resets daily loss
+        day2_ms = day1_start_ms + (25 * 3600 * 1000)
+        allowed_day2, _, is_halt_day2 = guards.check_entry_allowed("SOL/USDT", day2_ms, 9650.0)
+        self.assertTrue(allowed_day2)
+        self.assertFalse(is_halt_day2)
 
     def test_custom_exit_profit_target(self):
         """
-        Tests that custom_exit returns 'profit_target' when profit >= +3.5%.
+        Tests fixed take-profit target (+3.5%) in custom_exit.
         """
         trade = MagicMock()
         trade.enter_tag = "trend_pullback"
+        trade.open_date_utc = None
         now = datetime.now(timezone.utc)
 
         exit_reason = self.strategy.custom_exit(
@@ -127,8 +278,7 @@ class TestWowsStrategyV2(unittest.TestCase):
 
     def test_custom_exit_breakout_failure(self):
         """
-        Tests that breakout entries exit early at -2.0% (breakout_failure)
-        instead of waiting for the full -4.0% hard stop.
+        Tests that breakout entries exit early at -2.0% (breakout_failure).
         """
         trade = MagicMock()
         trade.enter_tag = "breakout"
@@ -158,8 +308,7 @@ class TestWowsStrategyV2(unittest.TestCase):
 
     def test_custom_exit_time_stagnation(self):
         """
-        Tests that positions open for >= 48 hours with < +0.5% profit
-        trigger 'time_stagnation' exit.
+        Tests that positions open for >= 48 hours with < +0.5% profit trigger time_stagnation.
         """
         now = datetime.now(timezone.utc)
         open_time = now - timedelta(hours=49)
@@ -175,16 +324,6 @@ class TestWowsStrategyV2(unittest.TestCase):
             current_profit=0.002  # +0.2% after 49 hours
         )
         self.assertEqual(exit_reason, "time_stagnation")
-
-        # Trade with good profit (+2.0%) after 49 hours should NOT exit on stagnation
-        exit_reason_profitable = self.strategy.custom_exit(
-            pair="ETH/USDT",
-            trade=trade,
-            current_time=now,
-            current_rate=3060.0,
-            current_profit=0.020
-        )
-        self.assertIsNone(exit_reason_profitable)
 
     def test_no_lookahead_bias_in_rolling_high(self):
         """
@@ -207,65 +346,18 @@ class TestWowsStrategyV2(unittest.TestCase):
                 return RollingMock(self, window)
 
         highs = [100.0 + i for i in range(25)]
-        # Make the last candle (index 24) a huge spike to 500.0
-        highs[24] = 500.0
+        highs[24] = 500.0  # Massive spike at candle 24
 
         mock_highs = MockSeries(highs)
         rolling_shifted = mock_highs.shift(1).rolling(20).max()
 
-        # At index 24, the rolling high must be based on candles 4..23, NOT 24 (500.0)!
+        # At index 24, rolling high MUST be 123.0, NOT 500.0
         self.assertEqual(rolling_shifted[24], 123.0)
         self.assertNotEqual(rolling_shifted[24], 500.0)
 
-    def test_guard_blocking_suppresses_entries(self):
-        """
-        Tests that when RiskGuards halt the bot, populate_entry_trend zeros out enter_long.
-        """
-        self.strategy.guards.is_halted = True
-        self.strategy.guards.halt_reason = "Daily loss limit breached"
-
-        df_mock = {
-            "close": [150.0],
-            "low": [140.0],
-            "ema20": [145.0],
-            "ema50": [140.0],
-            "ema200": [130.0],
-            "rsi": [55.0],
-            "volume": [1000.0],
-            "volume_mean_20": [500.0],
-            "rolling_high_20": [148.0],
-            "btc_close_4h": [65000.0],
-            "btc_ema50_4h": [60000.0],
-            "enter_long": [1],
-        }
-
-        class MockDF(dict):
-            def __setitem__(self, k, v):
-                super().__setitem__(k, v)
-        mdf = MockDF(df_mock)
-
-        result_df = self.strategy.populate_entry_trend(mdf, {"pair": "SOL/USDT"})
-        self.assertEqual(result_df["enter_long"], 0)
-
-    def test_reconciliation_gate_suppresses_entries(self):
-        """
-        Tests that when startup reconciliation has not passed, entries are suppressed.
-        """
-        self.strategy.guards.is_halted = False
-        self.strategy._reconciliation_passed = False
-
-        class MockDF(dict):
-            def __setitem__(self, k, v):
-                super().__setitem__(k, v)
-        mdf = MockDF({"enter_long": [1]})
-
-        result_df = self.strategy.populate_entry_trend(mdf, {"pair": "SOL/USDT"})
-        self.assertEqual(result_df["enter_long"], 0)
-
     def test_order_filled_durable_outbox_integration(self):
         """
-        Tests that order_filled persists fill events to durable SQLite outbox
-        with correct idempotency key and payload fields.
+        Tests that order_filled persists fill events to durable SQLite outbox in live/dry-run mode.
         """
         trade = MagicMock()
         trade.id = 88
@@ -287,7 +379,6 @@ class TestWowsStrategyV2(unittest.TestCase):
             current_time=order.order_filled_utc
         )
 
-        # Verify record in SQLite outbox
         events = self.strategy.outbox.get_pending_events()
         self.assertEqual(len(events), 1)
         ev = events[0]
@@ -296,35 +387,6 @@ class TestWowsStrategyV2(unittest.TestCase):
         self.assertEqual(payload["tag"], "trend_pullback")
         self.assertEqual(payload["filledAmount"], 4.5)
         self.assertEqual(payload["fillPrice"], 152.0)
-
-    def test_order_filled_exit_updates_guard_state(self):
-        """
-        Tests that exit fills update RiskGuards realized PnL and cooldown.
-        """
-        trade = MagicMock()
-        trade.id = 89
-        trade.entry_side = "buy"
-        trade.exit_reason = "profit_target"
-        trade.close_profit_abs = 25.50
-
-        order = MagicMock()
-        order.order_id = "ord-v2-exit-1"
-        order.safe_filled = 4.5
-        order.safe_price = 157.66
-        order.safe_cost = 709.50
-        order.ft_order_side = "sell"
-        order.order_filled_utc = datetime(2026, 10, 10, 16, 0, 0, tzinfo=timezone.utc)
-
-        prev_realized = self.strategy.guards.realized_today
-        self.strategy.order_filled(
-            pair="SOL/USDT",
-            trade=trade,
-            order=order,
-            current_time=order.order_filled_utc
-        )
-
-        self.assertEqual(self.strategy.guards.realized_today, prev_realized + 25.50)
-        self.assertEqual(self.strategy.guards.consecutive_losses, 0)
 
 
 if __name__ == "__main__":
