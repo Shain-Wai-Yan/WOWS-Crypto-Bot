@@ -105,6 +105,17 @@ class WowsStrategy(IStrategy):
 
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
         """Runs each iteration of the bot loop."""
+        # Memory optimization for 512MB RAM containers:
+        # Periodic garbage collection and glibc malloc_trim to return free memory to Linux
+        self._loop_count = getattr(self, "_loop_count", 0) + 1
+        if self._loop_count % 12 == 0:
+            import gc
+            gc.collect()
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
         # Update telemetry state snapshot
         try:
             open_trades = Trade.get_open_trades()

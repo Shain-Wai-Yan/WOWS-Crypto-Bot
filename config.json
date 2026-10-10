@@ -61,5 +61,8 @@
         "CORS_origins": [],
         "username": "admin",
         "password": "WowsCryptoBotPassword2026!"
+    },
+    "internals": {
+        "process_throttle_secs": 10
     }
 }

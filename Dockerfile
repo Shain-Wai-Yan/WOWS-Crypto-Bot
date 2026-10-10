@@ -2,6 +2,12 @@ FROM freqtradeorg/freqtrade:2024.12
 
 WORKDIR /freqtrade
 
+# Memory optimization for 512MB container runtime
+ENV MALLOC_ARENA_MAX=2
+ENV MALLOC_TRIM_THRESHOLD_=131072
+ENV MALLOC_MMAP_THRESHOLD_=131072
+ENV PYTHONUNBUFFERED=1
+
 # Copy requirements & install dependencies
 COPY requirements.txt /freqtrade/
 RUN pip install --no-cache-dir -r requirements.txt
