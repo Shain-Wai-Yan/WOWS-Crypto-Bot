@@ -12,7 +12,9 @@ services:
       - BOT_API_KEY=${BOT_API_KEY}
       - BOT_ID=${BOT_ID:-freqtrade-alpha-1}
       - SQLITE_DB_PATH=/freqtrade/user_data/outbox.db
+      - PYTHONUNBUFFERED=1
     command: >
       trade
       --config /freqtrade/config.json
+      --strategy-path /freqtrade/strategies
       --strategy WowsStrategy
