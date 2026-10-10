@@ -1,0 +1,30 @@
+# Environment Variables & Secrets
+.env
+.env.local
+
+# Virtual Environment
+.venv/
+env/
+venv/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# System
+.DS_Store
+
+# Freqtrade Local DBs & Outbox SQLite Storage
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+outbox.db*
+user_data/data/
+user_data/backtest_results/
+user_data/logs/
+user_data/outbox.db*
+user_data/trades.sqlite*

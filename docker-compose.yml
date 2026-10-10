@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  wows-crypto-bot:
+    build: .
+    restart: unless-stopped
+    container_name: wows_crypto_bot
+    volumes:
+      - ./user_data:/freqtrade/user_data
+    environment:
+      - WOWS_BASE_URL=${WOWS_BASE_URL:-http://host.docker.internal:3000}
+      - BOT_API_KEY=${BOT_API_KEY}
+      - BOT_ID=${BOT_ID:-freqtrade-alpha-1}
+      - SQLITE_DB_PATH=/freqtrade/user_data/outbox.db
+    command: >
+      trade
+      --config /freqtrade/config.json
+      --strategy WowsStrategy
