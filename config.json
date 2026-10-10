@@ -36,15 +36,32 @@
         "ccxt_config": {},
         "ccxt_async_config": {},
         "pair_whitelist": [
-            "SOL/USDT",
-            "BTC/USDT",
-            "ETH/USDT"
+            ".*/USDT"
         ],
-        "pair_blacklist": []
+        "pair_blacklist": [
+            ".*(_PREVIEW|BEAR|BULL|HALF|HEDGE|UP|DOWN|[1-5][SL]).*"
+        ]
     },
     "pairlists": [
         {
-            "method": "StaticPairList"
+            "method": "VolumePairList",
+            "number_assets": 20,
+            "sort_key": "quoteVolume",
+            "refresh_period": 1800
+        },
+        {
+            "method": "AgeFilter",
+            "min_days_listed": 10
+        },
+        {
+            "method": "PrecisionFilter"
+        },
+        {
+            "method": "PriceFilter"
+        },
+        {
+            "method": "SpreadFilter",
+            "max_spread_ratio": 0.005
         }
     ],
     "bot_name": "wows-crypto-bot",
