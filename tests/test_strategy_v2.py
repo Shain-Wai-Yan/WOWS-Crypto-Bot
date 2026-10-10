@@ -59,18 +59,42 @@ class TestWowsStrategyV2(unittest.TestCase):
         """
         live_config = {
             "dry_run": False,
-            "dry_run_wallet": 50000.0,  # Simulated value present in config
+            "dry_run_wallet": 50000.0,
             "stake_currency": "USDT",
         }
         live_strategy = WowsStrategyV2(live_config)
-        # Without wallets attached, MUST return 0.0, NOT 50000.0
         self.assertEqual(live_strategy._get_current_equity(), 0.0)
 
-        # Attaching a verified live wallet with $25,000 returns $25,000
         mock_wallets = MagicMock()
         mock_wallets.get_total_stake_amount.return_value = 25000.0
         live_strategy.wallets = mock_wallets
         self.assertEqual(live_strategy._get_current_equity(), 25000.0)
+
+    def test_custom_stake_amount_clamped_to_available_free_cash(self):
+        """
+        Critical Test: When free cash in wallet is less than calculated risk stake,
+        the allocated stake is clamped to free uncommitted cash.
+        """
+        now = datetime.now(timezone.utc)
+        self.strategy.config["dry_run_wallet"] = 10000.0  # Total equity = $10,000 -> theoretical stake = $555.56
+
+        mock_wallets = MagicMock()
+        mock_wallets.get_total_stake_amount.return_value = 10000.0
+        mock_wallets.get_available_stake_amount.return_value = 300.0  # Only $300 uncommitted cash
+        self.strategy.wallets = mock_wallets
+
+        stake = self.strategy.custom_stake_amount(
+            pair="SOL/USDT",
+            current_time=now,
+            current_rate=150.0,
+            proposed_stake=100.0,
+            min_stake=10.0,
+            max_stake=10000.0,
+            leverage=1.0,
+            entry_tag="trend_pullback",
+            side="buy"
+        )
+        self.assertEqual(stake, 300.0)
 
     def test_exit_path_remains_operational_when_reconciliation_fails(self):
         """

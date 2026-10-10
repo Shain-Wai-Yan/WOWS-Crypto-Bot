@@ -17,10 +17,11 @@ Core Invariants:
    - Setup B (Confirmed Breakout): Enters volatility expansions above 20-candle high.
 4. Zero lookahead bias: Breakout thresholds strictly exclude current candle via shift(1).
 5. Informative Higher Timeframe: 4h BTC EMA 50 trend confirmation filter.
-6. Mathematical Risk-Budget Sizing:
-   - Risk fraction: 0.25% of validated equity per trade.
-   - Stop distance: 4.0% initial stop + 0.5% cost/slippage allowance (4.5% total).
-   - Maximum position cap: 10.0% of portfolio equity.
+6. Mathematical Risk-Budget Sizing with Strict Equity Separation:
+   - Total Portfolio Equity (`_get_current_equity()`): Total account equity (free cash + open trade values)
+     is used strictly to calculate risk dollar budget (0.25%) and the 10.0% position exposure ceiling.
+   - Available Uncommitted Stake Balance: Actual order size is capped at free unallocated cash
+     (`wallets.get_available_stake_amount()`), ensuring no position over-allocates beyond free liquidity.
    - Strict Live vs Dry-Run Equity Isolation:
      * Live trading MUST use verified exchange wallet equity (`wallets.get_total_stake_amount()`).
        Fails closed (returns 0.0) if verified live equity is unavailable. NEVER falls back to dry_run_wallet!
@@ -489,7 +490,13 @@ class WowsStrategyV2(IStrategy):
     ) -> float:
         """
         Calculates mathematical risk-budget stake size:
-        Stake = min((Equity * Risk_fraction) / Stop_distance_fraction, Position_cap, Available_balance)
+        Stake = min((Total_Equity * Risk_fraction) / Stop_distance_fraction, Position_cap, Available_cash)
+
+        Equity Distinction:
+        - Total Portfolio Equity (`total_equity`): Free cash + open trade values.
+          Determines the risk dollar budget (0.25%) and maximum 10.0% position exposure ceiling.
+        - Available Cash (`available_balance`): Clamped by uncommitted free stake currency
+          (`wallets.get_available_stake_amount()`) so an entry cannot over-allocate beyond free liquidity.
 
         Invariants:
         - Fails closed (returns 0.0) if validated equity is not available.
@@ -501,17 +508,24 @@ class WowsStrategyV2(IStrategy):
             logger.warning(f"Skipping stake calculation on {pair}: Validated equity unavailable ({total_equity}). Failing closed.")
             return 0.0
 
-        # Calculate risk budget
+        # Calculate risk dollar budget based on total portfolio equity
         risk_budget = total_equity * self.RISK_FRACTION_PER_TRADE  # e.g., $1000 * 0.0025 = $2.50
         risk_based_stake = risk_budget / self.STOP_DISTANCE_FRACTION  # e.g., $2.50 / 0.045 = $55.55
 
-        # Maximum notional cap (10% of portfolio)
+        # Maximum position cap (10% of total portfolio equity)
         position_cap = total_equity * self.MAX_POSITION_EQUITY_RATIO
 
-        # Available capital cap
+        # Available capital cap: bound by max_stake and actual uncommitted cash in wallet
         available_balance = max_stake if max_stake > 0 else proposed_stake
+        if hasattr(self, "wallets") and self.wallets:
+            try:
+                free_cash = float(self.wallets.get_available_stake_amount())
+                if free_cash > 0:
+                    available_balance = min(available_balance, free_cash)
+            except Exception:
+                pass
 
-        # Sizing formula
+        # Final allocated stake is bounded by risk budget, position cap, and available cash
         calculated_stake = min(risk_based_stake, position_cap, available_balance)
 
         # Exchange minimum stake safety gate: DO NOT silently inflate stake
