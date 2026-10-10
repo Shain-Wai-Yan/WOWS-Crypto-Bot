@@ -8,7 +8,12 @@ from typing import Optional
 import requests
 from requests.exceptions import RequestException, Timeout
 
-from .outbox import OutboxManager
+import sys
+from pathlib import Path
+_DIR = str(Path(__file__).parent.resolve())
+if _DIR not in sys.path:
+    sys.path.insert(0, _DIR)
+from outbox import OutboxManager
 
 logger = logging.getLogger("WowsDispatcher")
 

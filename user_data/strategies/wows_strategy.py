@@ -9,11 +9,17 @@ from freqtrade.persistence import Trade, Order
 from pandas import DataFrame
 import talib.abstract as ta
 
-from .outbox import OutboxManager
-from .dispatcher import DispatcherWorker
-from .reconciliation import ReconciliationClient
-from .telemetry import TelemetryClient
-from .guards import RiskGuards
+import sys
+from pathlib import Path
+_DIR = str(Path(__file__).parent.resolve())
+if _DIR not in sys.path:
+    sys.path.insert(0, _DIR)
+
+from outbox import OutboxManager
+from dispatcher import DispatcherWorker
+from reconciliation import ReconciliationClient
+from telemetry import TelemetryClient
+from guards import RiskGuards
 
 logger = logging.getLogger("WowsStrategy")
 
