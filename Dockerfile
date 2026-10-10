@@ -12,6 +12,8 @@ COPY user_data/strategies/ /freqtrade/strategies/
 COPY user_data/ /freqtrade/user_data/
 
 # Mountable volume for outbox.db, tradesv3.dryrun.sqlite, and downloaded data
+EXPOSE 8080
+
 VOLUME ["/freqtrade/user_data"]
 
 CMD ["trade", "--config", "/freqtrade/config.json", "--strategy-path", "/freqtrade/strategies", "--strategy", "WowsStrategy"]

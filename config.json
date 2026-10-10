@@ -49,5 +49,17 @@
     ],
     "bot_name": "wows-crypto-bot",
     "initial_state": "running",
-    "force_entry_enable": false
+    "force_entry_enable": false,
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "0.0.0.0",
+        "listen_port": 8080,
+        "verbosity": "info",
+        "enable_openapi": false,
+        "jwt_secret_key": "0c9602fb32f45a2d351a9068db441c2930338280efbeaa90620b9f86d2dc68d1",
+        "ws_token": "6c94aa72b8fbaf41d92aa1da7a2c1b05826009de287fe837123b78fd7ce38ddc",
+        "CORS_origins": [],
+        "username": "admin",
+        "password": "WowsCryptoBotPassword2026!"
+    }
 }
