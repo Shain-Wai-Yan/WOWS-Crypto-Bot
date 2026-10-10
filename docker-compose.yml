@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   wows-crypto-bot:
     build: .
@@ -16,5 +14,4 @@ services:
     command: >
       trade
       --config /freqtrade/config.json
-      --strategy-path /freqtrade/strategies
       --strategy WowsStrategy
