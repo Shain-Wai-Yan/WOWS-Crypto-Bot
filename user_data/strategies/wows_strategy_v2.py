@@ -4,7 +4,7 @@ WOWS Crypto Bot v2: Multi-Setup Spot Strategy (WowsStrategyV2)
 Designed for steady, risk-controlled paper-trading progress with enhanced
 opportunity frequency while strictly controlling downside exposure.
 
-Experiment V2-B Architecture:
+Experiment V2-B Architecture (1.0% Risk per Trade & Capital Deployment):
 1. Breakout-Only Engine (enable_trend_pullback = False).
 2. 36-period Donchian High Lookback (shift(1).rolling(36).max()) for structural expansion.
 3. Directional Velocity Filter: ADX(14) > 22.0.
@@ -15,9 +15,11 @@ Experiment V2-B Architecture:
    - Dynamic Trailing Stop: 2.5 * ATR(14) from high (uncapped right-tail runners).
    - Closed-Candle Trend Exit: Close below 1h EMA 20 (populate_exit_trend).
    - Time Stagnation Exit: 48h with < +0.5% profit.
-5. Zero lookahead bias: Breakout thresholds strictly exclude current candle via shift(1).
-6. Informative Higher Timeframe: 4h BTC EMA 50 trend confirmation filter.
-7. Mathematical Risk-Budget Sizing with Strict Equity Separation.
+5. Capital Deployment & Sizing:
+   - RISK_FRACTION_PER_TRADE = 0.010 (1.0% risk per trade).
+   - MAX_POSITION_EQUITY_RATIO = 0.25 (25% position cap per trade).
+6. Zero lookahead bias: Breakout thresholds strictly exclude current candle via shift(1).
+7. Informative Higher Timeframe: 4h BTC EMA 50 trend confirmation filter.
 8. Production resilience (Live/Dry-run only): Outbox, Telemetry, Reconciliation, RiskGuards.
 """
 
@@ -111,10 +113,10 @@ class WowsStrategyV2(IStrategy):
         "0": 1.0  # 100% ceiling - winners are uncapped to capture fat right-tail extensions
     }
 
-    # Strategy Parameters
-    RISK_FRACTION_PER_TRADE = 0.0025    # 0.25% equity risked per trade
-    STOP_DISTANCE_FRACTION = 0.045      # 4.0% stop + 0.5% fee/slippage allowance
-    MAX_POSITION_EQUITY_RATIO = 0.10    # 10% maximum portfolio allocation per position
+    # Strategy Parameters (1.0% Risk Sizing for Proper Capital Deployment)
+    RISK_FRACTION_PER_TRADE = 0.010     # 1.0% equity risked per trade ($100 risk on $10,000 equity)
+    STOP_DISTANCE_FRACTION = 0.045      # 4.0% stop + 0.5% fee/slippage allowance -> $2,222 position size
+    MAX_POSITION_EQUITY_RATIO = 0.25    # 25% maximum portfolio allocation per position
     BREAKOUT_FAILURE_LOSS_PCT = -0.02   # Exit breakout at -2.0% if thesis fails
     STAGNATION_HOURS = 48.0             # Exit after 48h if trade has made no progress
     STAGNATION_MIN_PROFIT = 0.005       # +0.5% minimum threshold for stagnation
@@ -530,11 +532,11 @@ class WowsStrategyV2(IStrategy):
             return 0.0
 
         # Calculate risk dollar budget based on total portfolio equity
-        risk_budget = total_equity * self.RISK_FRACTION_PER_TRADE  # e.g., $1000 * 0.0025 = $2.50
-        risk_based_stake = risk_budget / self.STOP_DISTANCE_FRACTION  # e.g., $2.50 / 0.045 = $55.55
+        risk_budget = total_equity * self.RISK_FRACTION_PER_TRADE  # e.g., $10000 * 0.010 = $100.00
+        risk_based_stake = risk_budget / self.STOP_DISTANCE_FRACTION  # e.g., $100.00 / 0.045 = $2222.22
 
-        # Maximum position cap (10% of total portfolio equity)
-        position_cap = total_equity * self.MAX_POSITION_EQUITY_RATIO
+        # Maximum position cap (25% of total portfolio equity)
+        position_cap = total_equity * self.MAX_POSITION_EQUITY_RATIO  # e.g., $10000 * 0.25 = $2500.00
 
         # Available capital cap: bound by max_stake and actual uncommitted cash in wallet
         available_balance = max_stake if max_stake > 0 else proposed_stake

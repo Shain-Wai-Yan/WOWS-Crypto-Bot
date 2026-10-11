@@ -158,17 +158,17 @@ class TestWowsStrategyV2(unittest.TestCase):
 
     def test_custom_stake_amount_across_multiple_equity_levels(self):
         """
-        Tests risk-budget sizing formula across diverse starting balances:
-        Stake = min((Equity * 0.0025) / 0.045, Equity * 0.10, Available_balance)
-        Ratio = 0.0025 / 0.045 = 5.5555...%
+        Tests 1.0% risk-budget sizing formula across diverse starting balances:
+        Stake = min((Equity * 0.010) / 0.045, Equity * 0.25, Available_balance)
+        Ratio = 0.010 / 0.045 = 22.2222...%
         """
         now = datetime.now(timezone.utc)
 
         test_cases = [
-            (1000.0, 55.56),
-            (5000.0, 277.78),
-            (10000.0, 555.56),
-            (50000.0, 2777.78),
+            (1000.0, 222.22),
+            (5000.0, 1111.11),
+            (10000.0, 2222.22),
+            (50000.0, 11111.11),
         ]
 
         for eq, expected_stake in test_cases:
@@ -179,7 +179,7 @@ class TestWowsStrategyV2(unittest.TestCase):
                 current_rate=150.0,
                 proposed_stake=100.0,
                 min_stake=10.0,
-                max_stake=10000.0,
+                max_stake=50000.0,
                 leverage=1.0,
                 entry_tag="breakout",
                 side="buy"
@@ -207,24 +207,24 @@ class TestWowsStrategyV2(unittest.TestCase):
         )
         self.assertEqual(stake, 0.0)
 
-    def test_custom_stake_amount_position_cap_10_percent(self):
+    def test_custom_stake_amount_position_cap_25_percent(self):
         """
-        Tests that stake never exceeds 10% maximum portfolio allocation per position.
+        Tests that stake never exceeds 25% maximum portfolio allocation per position.
         """
         now = datetime.now(timezone.utc)
-        self.strategy.STOP_DISTANCE_FRACTION = 0.01  # very small stop yields $2,500
+        self.strategy.STOP_DISTANCE_FRACTION = 0.01  # very small stop yields $10,000 theoretical stake
         stake = self.strategy.custom_stake_amount(
             pair="SOL/USDT",
             current_time=now,
             current_rate=150.0,
             proposed_stake=100.0,
             min_stake=10.0,
-            max_stake=5000.0,
+            max_stake=10000.0,
             leverage=1.0,
             entry_tag="breakout",
             side="buy"
         )
-        self.assertEqual(stake, 1000.0)
+        self.assertEqual(stake, 2500.0)
 
     def test_custom_stake_amount_min_stake_safety_skip(self):
         """
@@ -232,7 +232,7 @@ class TestWowsStrategyV2(unittest.TestCase):
         the trade is skipped (0.0 returned) rather than silently inflated.
         """
         now = datetime.now(timezone.utc)
-        self.strategy.config["dry_run_wallet"] = 100.0
+        self.strategy.config["dry_run_wallet"] = 10.0  # yields $2.22 stake < $10 min_stake
         stake = self.strategy.custom_stake_amount(
             pair="SOL/USDT",
             current_time=now,

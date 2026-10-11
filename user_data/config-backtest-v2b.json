@@ -1,5 +1,5 @@
 {
-    "max_open_trades": 3,
+    "max_open_trades": 4,
     "stake_currency": "USDT",
     "stake_amount": 100,
     "tradable_balance_ratio": 0.99,
@@ -32,7 +32,11 @@
             "SOL/USDT",
             "DOGE/USDT",
             "XRP/USDT",
-            "ETH/USDT"
+            "ETH/USDT",
+            "AVAX/USDT",
+            "LINK/USDT",
+            "NEAR/USDT",
+            "SUI/USDT"
         ],
         "pair_blacklist": []
     },
@@ -41,7 +45,7 @@
             "method": "StaticPairList"
         }
     ],
-    "bot_name": "wows-crypto-bot-v2b",
+    "bot_name": "wows-crypto-bot-v2c",
     "wows_strategy": {
         "enable_trend_pullback": false,
         "enable_breakout": true
