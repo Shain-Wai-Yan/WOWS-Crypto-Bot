@@ -1,5 +1,5 @@
 {
-    "max_open_trades": 3,
+    "max_open_trades": 4,
     "stake_currency": "USDT",
     "stake_amount": 100,
     "tradable_balance_ratio": 0.99,
@@ -29,11 +29,15 @@
         "ccxt_config": {},
         "ccxt_async_config": {},
         "pair_whitelist": [
-            "BTC/USDT",
-            "ETH/USDT",
             "SOL/USDT",
             "DOGE/USDT",
-            "XRP/USDT"
+            "XRP/USDT",
+            "ETH/USDT",
+            "SUI/USDT",
+            "AVAX/USDT",
+            "LINK/USDT",
+            "NEAR/USDT",
+            "BTC/USDT"
         ],
         "pair_blacklist": []
     },
@@ -42,5 +46,9 @@
             "method": "StaticPairList"
         }
     ],
-    "bot_name": "wows-crypto-bot-backtest"
+    "bot_name": "wows-crypto-bot-backtest",
+    "wows_strategy": {
+        "enable_trend_pullback": false,
+        "enable_breakout": true
+    }
 }
