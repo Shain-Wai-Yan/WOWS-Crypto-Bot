@@ -4,41 +4,21 @@ WOWS Crypto Bot v2: Multi-Setup Spot Strategy (WowsStrategyV2)
 Designed for steady, risk-controlled paper-trading progress with enhanced
 opportunity frequency while strictly controlling downside exposure.
 
-Core Invariants:
-1. Strictly dry_run = True, Spot long-only, Zero leverage.
-2. Complete Backtest / Live Isolation:
-   - Backtest & Hyperopt modes run with ZERO network calls, zero thread spawns,
-     and without dependency on external live WOWS services.
-   - Historical vectorized entry signals are purely mathematical and stateless.
-   - Stateful risk controls are evaluated trade-by-trade chronologically via
-     Freqtrade's dynamic `confirm_trade_entry()` hook.
-3. Multi-setup architecture:
-   - Setup A (Trend Pullback): Enters healthy retracements in confirmed uptrends.
-   - Setup B (Confirmed Breakout): Enters volatility expansions above 20-candle high.
-4. Zero lookahead bias: Breakout thresholds strictly exclude current candle via shift(1).
-5. Informative Higher Timeframe: 4h BTC EMA 50 trend confirmation filter.
-6. Mathematical Risk-Budget Sizing with Strict Equity Separation:
-   - Total Portfolio Equity (`_get_current_equity()`): Total account equity (free cash + open trade values)
-     is used strictly to calculate risk dollar budget (0.25%) and the 10.0% position exposure ceiling.
-   - Available Uncommitted Stake Balance: Actual order size is capped at free unallocated cash
-     (`wallets.get_available_stake_amount()`), ensuring no position over-allocates beyond free liquidity.
-   - Strict Live vs Dry-Run Equity Isolation:
-     * Live trading MUST use verified exchange wallet equity (`wallets.get_total_stake_amount()`).
-       Fails closed (returns 0.0) if verified live equity is unavailable. NEVER falls back to dry_run_wallet!
-     * Dry-run / backtest modes use simulated wallet equity with dry_run_wallet fallback.
-   - Skips trade if calculated stake is below exchange min_stake (no silent inflation).
-7. Explicit Exit Semantics:
-   - Intrabar hard maximum stop: -4.0% (`stoploss = -0.04`).
-   - Intrabar dynamic target exit: +3.5% (`custom_exit: 'profit_target'`).
-   - Intrabar breakout failure exit: -2.0% (`custom_exit: 'breakout_failure'`).
-   - Elapsed time stagnation exit: 48 hours with < +0.5% profit (`custom_exit: 'time_stagnation'`).
-   - Closed-candle trend exit: 2 consecutive closes below EMA 20 (`populate_exit_trend`).
-   - Exit path remains completely operational even if new entries are blocked by reconciliation or guards.
-8. Production resilience (Live/Dry-run only):
-   - Durable thread-safe SQLite outbox with SHA256 integrity and stable event IDs.
-   - 60-second telemetry heartbeats to WOWS backend.
-   - Startup reconciliation parity gate (blocks live entries if discrepancies or quarantines exist).
-   - Two-tier RiskGuards (3.0% daily drawdown limit, 3 consecutive losses, 5-bar pair cooldown).
+Experiment V2-B Architecture:
+1. Breakout-Only Engine (enable_trend_pullback = False).
+2. 36-period Donchian High Lookback (shift(1).rolling(36).max()) for structural expansion.
+3. Directional Velocity Filter: ADX(14) > 22.0.
+4. Two-Tier Asymmetric Exits:
+   - Initial stop: -4.0% hard stop.
+   - Fast Breakout Failure Cut: -2.0% (custom_exit: 'breakout_failure').
+   - Breakeven Lock: Ratchet stop to +0.3% (covers fees) when profit reaches +2.5%.
+   - Dynamic Trailing Stop: 2.5 * ATR(14) from high (uncapped right-tail runners).
+   - Closed-Candle Trend Exit: Close below 1h EMA 20 (populate_exit_trend).
+   - Time Stagnation Exit: 48h with < +0.5% profit.
+5. Zero lookahead bias: Breakout thresholds strictly exclude current candle via shift(1).
+6. Informative Higher Timeframe: 4h BTC EMA 50 trend confirmation filter.
+7. Mathematical Risk-Budget Sizing with Strict Equity Separation.
+8. Production resilience (Live/Dry-run only): Outbox, Telemetry, Reconciliation, RiskGuards.
 """
 
 # pyright: reportMissingImports=false
@@ -46,13 +26,14 @@ Core Invariants:
 import os
 import json
 import time
+import math
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
 # Graceful imports to allow execution both within Freqtrade container and local IDE / test environments
 try:
-    from freqtrade.strategy import IStrategy, informative, merge_informative_pair  # type: ignore
+    from freqtrade.strategy import IStrategy, informative, merge_informative_pair, stoploss_from_open  # type: ignore
     from freqtrade.persistence import Trade, Order  # type: ignore
 except ImportError:
     class IStrategy:  # type: ignore
@@ -70,6 +51,15 @@ except ImportError:
         return decorator
     def merge_informative_pair(dataframe, informative, timeframe, inf_timeframe, ffill=True):  # type: ignore
         return dataframe
+    def stoploss_from_open(open_relative_stop: float, current_profit: float, is_short: bool = False, leverage: float = 1.0) -> float:  # type: ignore
+        _current_profit = current_profit / leverage
+        if (_current_profit == -1 and not is_short) or (is_short and _current_profit == 1):
+            return 1.0
+        if is_short is True:
+            stoploss = -1 + ((1 - open_relative_stop / leverage) / (1 - _current_profit))
+        else:
+            stoploss = 1 - ((1 + open_relative_stop / leverage) / (1 + _current_profit))
+        return max(stoploss * leverage, 0.0)
 
 try:
     from pandas import DataFrame, Series  # type: ignore
@@ -94,12 +84,12 @@ from reconciliation import ReconciliationClient
 from telemetry import TelemetryClient
 from guards import RiskGuards
 
-logger = logging.getLogger("WowsStrategyV2")
+logger = logging.getLogger(__name__)
 
 
 class WowsStrategyV2(IStrategy):
     """
-    WOWS Crypto Bot v2 Strategy Class.
+    WOWS Crypto Bot v2 Strategy Class (Experiment V2-B: Breakout Asymmetry & Consolidation Filter).
     """
     INTERFACE_VERSION = 3
 
@@ -109,16 +99,16 @@ class WowsStrategyV2(IStrategy):
     process_only_new_candles = True
     startup_candle_count = 200  # Required for 200 EMA warm-up
     can_short = False
-    enable_trend_pullback: bool = True
+    enable_trend_pullback: bool = False
     enable_breakout: bool = True
 
     # Risk & Protective Exits (managed via Freqtrade engine + custom callbacks)
     stoploss = -0.04  # -4.0% Hard Initial Stop
-    use_custom_stoploss = False
+    use_custom_stoploss = True
 
-    # Minimal ROI table (custom_exit handles discretionary / dynamic targets)
+    # Minimal ROI table: Disabled/Ceiling only; custom_stoploss and custom_exit manage all exits
     minimal_roi = {
-        "0": 0.10  # 10% safety ceiling, custom_exit triggers targets sooner
+        "0": 1.0  # 100% ceiling - winners are uncapped to capture fat right-tail extensions
     }
 
     # Strategy Parameters
@@ -126,7 +116,6 @@ class WowsStrategyV2(IStrategy):
     STOP_DISTANCE_FRACTION = 0.045      # 4.0% stop + 0.5% fee/slippage allowance
     MAX_POSITION_EQUITY_RATIO = 0.10    # 10% maximum portfolio allocation per position
     BREAKOUT_FAILURE_LOSS_PCT = -0.02   # Exit breakout at -2.0% if thesis fails
-    PROFIT_TARGET_PCT = 0.035           # +3.5% fixed take-profit target
     STAGNATION_HOURS = 48.0             # Exit after 48h if trade has made no progress
     STAGNATION_MIN_PROFIT = 0.005       # +0.5% minimum threshold for stagnation
 
@@ -153,7 +142,7 @@ class WowsStrategyV2(IStrategy):
         self.bot_api_key = os.getenv("BOT_API_KEY", "")
 
         strat_cfg = self.config.get("wows_strategy", {})
-        self.enable_trend_pullback = strat_cfg.get("enable_trend_pullback", getattr(self, "enable_trend_pullback", True))
+        self.enable_trend_pullback = strat_cfg.get("enable_trend_pullback", getattr(self, "enable_trend_pullback", False))
         self.enable_breakout = strat_cfg.get("enable_breakout", getattr(self, "enable_breakout", True))
 
         # Initialize durable subcomponents
@@ -248,35 +237,24 @@ class WowsStrategyV2(IStrategy):
             except Exception:
                 pass
 
-        # Update telemetry state snapshot
-        try:
-            open_trades = Trade.get_open_trades()
-            exposure = sum(float(t.stake_amount) for t in open_trades)
-            status_str = "running" if (self._reconciliation_passed and not self.guards.is_halted) else (
-                "halted" if self.guards.is_halted else "attention_required"
-            )
-            self.telemetry.update_state(
-                status=status_str,
-                active_pairs=self.dp.current_whitelist() if hasattr(self, "dp") and self.dp else [],
-                open_trades_count=len(open_trades),
-                current_exposure=exposure,
-            )
-        except Exception:
-            pass
-
     def informative_pairs(self) -> List[Tuple[str, str]]:
         """Defines higher-timeframe informative pair requirements."""
         stake = self.config.get("stake_currency", "USDT")
         return [(f"BTC/{stake}", self.inf_timeframe)]
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """Calculates vectorized technical indicators on 1h candles + merges 4h BTC filter."""
+        """
+        Populates indicators on the primary timeframe (1h).
+        Zero lookahead bias: rolling highs are strictly shifted by 1 candle.
+        """
         # Ensure talib or fallback calculation
         if ta is not None:
             dataframe["ema20"] = ta.EMA(dataframe, timeperiod=20)
             dataframe["ema50"] = ta.EMA(dataframe, timeperiod=50)
             dataframe["ema200"] = ta.EMA(dataframe, timeperiod=200)
             dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+            dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
+            dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
         else:
             # Fallback for standalone/mock tests
             dataframe["ema20"] = dataframe["close"].ewm(span=20, adjust=False).mean()
@@ -287,12 +265,23 @@ class WowsStrategyV2(IStrategy):
             loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
             rs = gain / (loss + 1e-9)
             dataframe["rsi"] = 100 - (100 / (1 + rs))
+            tr = DataFrame([
+                dataframe["high"] - dataframe["low"],
+                (dataframe["high"] - dataframe["close"].shift(1)).abs(),
+                (dataframe["low"] - dataframe["close"].shift(1)).abs()
+            ]).max(axis=0)
+            dataframe["atr"] = tr.rolling(14).mean().fillna(dataframe["close"] * 0.02)
+            dataframe["adx"] = Series(25.0, index=dataframe.index)
+
+        # ATR percentage for dynamic trailing stop
+        dataframe["atr_pct"] = dataframe["atr"] / dataframe["close"]
 
         # Volume baseline
         dataframe["volume_mean_20"] = dataframe["volume"].rolling(window=20).mean()
 
-        # Rolling 20-candle high STRICTLY shifted by 1 candle to prevent lookahead bias
-        # At candle t, compares against max(high[t-20 : t-1]), NEVER high[t]
+        # Rolling 36-candle high STRICTLY shifted by 1 candle to prevent lookahead bias
+        dataframe["rolling_high_36"] = dataframe["high"].shift(1).rolling(window=36).max()
+        # Keep rolling_high_20 for backwards-compatibility
         dataframe["rolling_high_20"] = dataframe["high"].shift(1).rolling(window=20).max()
 
         # Merge 4h BTC trend filter if DataProvider is available
@@ -327,7 +316,7 @@ class WowsStrategyV2(IStrategy):
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Purely vectorized, stateless calculation of candidate entry signals for
-        Setup A (Trend Pullback) and Setup B (Breakout).
+        Setup A (Trend Pullback) and Setup B (Confirmed Breakout).
         Stateful risk gates (guards, reconciliation) are evaluated dynamically in confirm_trade_entry().
         """
         dataframe["enter_long"] = 0
@@ -339,10 +328,6 @@ class WowsStrategyV2(IStrategy):
         positive_volume = dataframe["volume"] > 0
 
         # --- SETUP A: Trend Pullback ---
-        # 1. Broad uptrend on coin and BTC
-        # 2. Candle closes back above EMA 20 after pulling back into/below it
-        # 3. RSI 14 between 40 and 60 (healthy consolidation without collapse)
-        # 4. Volume exceeds 20-candle average
         reclaim_ema20 = (
             (dataframe["close"] > dataframe["ema20"]) &
             (
@@ -363,11 +348,14 @@ class WowsStrategyV2(IStrategy):
         )
 
         # --- SETUP B: Confirmed Breakout ---
-        # 1. Close exceeds the rolling 20-candle high (shifted by 1 to exclude current candle)
-        # 2. Broad uptrend on coin and BTC
-        # 3. RSI 14 between 50 and 70 (strong momentum without being overbought > 70)
-        # 4. Expansion volume exceeds 1.5x 20-candle average
-        breakout_trigger = dataframe["close"] > dataframe["rolling_high_20"]
+        # 1. Close exceeds the rolling 36-candle high (shifted by 1 to exclude current candle)
+        # 2. Directional velocity filter: ADX(14) > 22 (filters low-volatility churn)
+        # 3. Broad uptrend on coin and BTC
+        # 4. RSI 14 between 50 and 70 (strong momentum without being overbought > 70)
+        # 5. Expansion volume exceeds 1.5x 20-candle average
+        rolling_high = dataframe["rolling_high_36"] if "rolling_high_36" in dataframe.columns else dataframe.get("rolling_high_20", dataframe["close"])
+        breakout_trigger = dataframe["close"] > rolling_high
+        adx_filter = (dataframe["adx"] > 22.0) if "adx" in dataframe.columns else Series(True, index=dataframe.index)
         rsi_breakout = (dataframe["rsi"] >= 50.0) & (dataframe["rsi"] <= 70.0)
         volume_breakout = dataframe["volume"] > (1.5 * dataframe["volume_mean_20"])
 
@@ -376,6 +364,7 @@ class WowsStrategyV2(IStrategy):
             btc_filter &
             positive_volume &
             breakout_trigger &
+            adx_filter &
             rsi_breakout &
             volume_breakout
         )
@@ -432,16 +421,15 @@ class WowsStrategyV2(IStrategy):
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
-        Populates baseline trend breakdown exit.
-        Requires 2 consecutive closed candles below EMA 20 (candle close confirmation).
+        Populates closed-candle trend breakdown exit.
+        Exits when candle closes below 1h EMA 20.
         Remains operational regardless of reconciliation or entry guard state.
         """
         dataframe["exit_long"] = 0
 
-        # Confirmed breakdown: 2 consecutive closes below 20 EMA
+        # Confirmed breakdown: closed candle below 20 EMA
         trend_breakdown = (
             (dataframe["close"] < dataframe["ema20"]) &
-            (dataframe["close"].shift(1) < dataframe["ema20"].shift(1)) &
             (dataframe["volume"] > 0)
         )
         dataframe.loc[trend_breakdown, "exit_long"] = 1
@@ -457,23 +445,17 @@ class WowsStrategyV2(IStrategy):
         **kwargs
     ) -> Optional[str]:
         """
-        Trade-specific dynamic exit callback.
-        Enforces:
-        - Fixed profit target (+3.5%) [intrabar check]
-        - Breakout failure cutoff (-2.0%) [intrabar check]
-        - Elapsed time stagnation (48h with < +0.5% profit)
-        Remains operational regardless of reconciliation or entry guard state.
+        Protective and failure custom exit conditions.
+        NOTE: Hard profit ceiling (+3.5%) is REMOVED to allow fat right-tail winners to run.
+        Winners are managed dynamically via custom_stoploss (breakeven lock & ATR trailing)
+        and populate_exit_trend (1h EMA 20 breakdown).
         """
-        # 1. Target Take Profit (+3.5%)
-        if current_profit >= self.PROFIT_TARGET_PCT:
-            return "profit_target"
-
-        # 2. Breakout Failure Protection
-        # If entered via breakout and price reverses -2.0%, exit early before hitting -4.0% stoploss
+        # 1. Breakout Failure Cut (-2.0%)
+        # If price falls 2.0% below entry on a breakout trade, exit immediately to cut losers early
         if trade.enter_tag == "breakout" and current_profit <= self.BREAKOUT_FAILURE_LOSS_PCT:
             return "breakout_failure"
 
-        # 3. Time Stagnation Exit
+        # 2. Time Stagnation Exit
         # Free capital if position makes no progress after 48 hours
         open_date = getattr(trade, "open_date_utc", None)
         if open_date and isinstance(open_date, datetime):
@@ -482,6 +464,48 @@ class WowsStrategyV2(IStrategy):
                 return "time_stagnation"
 
         return None
+
+    def custom_stoploss(
+        self,
+        pair: str,
+        trade: Trade,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        after_fill: bool,
+        **kwargs
+    ) -> Optional[float]:
+        """
+        Two-Tier Asymmetric Stoploss:
+        1. Below +2.5% profit: Keep initial stop loss intact (-4.0% hard stop).
+        2. Once trade reaches +2.5% profit:
+           - Ratchet stop to +0.3% above entry price (breakeven lock covering fee friction).
+           - Trail at 2.5 * ATR(14) below current_rate as profit expands further.
+        """
+        if current_profit < 0.025:
+            return None
+
+        # Breakeven lock distance (+0.3% above entry price)
+        be_stop = stoploss_from_open(0.003, current_profit)
+
+        # Dynamic ATR trailing stop
+        atr_pct = 0.015  # Fallback 1.5% if analyzed dataframe is inaccessible
+        if hasattr(self, "dp") and self.dp:
+            try:
+                analyzed_df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+                if not analyzed_df.empty and "atr_pct" in analyzed_df.columns:
+                    val = analyzed_df["atr_pct"].iloc[-1]
+                    if val is not None and not (math.isnan(val) or math.isinf(val)) and val > 0:
+                        atr_pct = float(val)
+            except Exception:
+                pass
+
+        # 2.5 * ATR(14), bounded between 2.0% and 7.0%
+        atr_dist = max(0.02, min(0.07, 2.5 * atr_pct))
+
+        # We choose the tighter stop (smaller distance from current rate = higher stop price)
+        chosen_dist = min(be_stop, atr_dist)
+        return -chosen_dist
 
     def custom_stake_amount(
         self,
@@ -499,17 +523,6 @@ class WowsStrategyV2(IStrategy):
         """
         Calculates mathematical risk-budget stake size:
         Stake = min((Total_Equity * Risk_fraction) / Stop_distance_fraction, Position_cap, Available_cash)
-
-        Equity Distinction:
-        - Total Portfolio Equity (`total_equity`): Free cash + open trade values.
-          Determines the risk dollar budget (0.25%) and maximum 10.0% position exposure ceiling.
-        - Available Cash (`available_balance`): Clamped by uncommitted free stake currency
-          (`wallets.get_available_stake_amount()`) so an entry cannot over-allocate beyond free liquidity.
-
-        Invariants:
-        - Fails closed (returns 0.0) if validated equity is not available.
-        - Rejects trade (returns 0.0) if calculated stake is less than exchange min_stake (no silent inflation).
-        - Never exceeds 10% maximum portfolio allocation per position.
         """
         total_equity = self._get_current_equity()
         if total_equity <= 0:
@@ -548,7 +561,7 @@ class WowsStrategyV2(IStrategy):
 
     def order_filled(self, pair: str, trade: Trade, order: Order, current_time: datetime, **kwargs) -> None:
         """
-        Documented Freqtrade hook called on order fill.
+        Freqtrade hook called on order fill.
         Extracts fields via documented Order attributes.
         Durably commits to SQLite outbox only during live/dry-run execution.
         Updates RiskGuards on exit fills in both backtesting and live runtimes.
