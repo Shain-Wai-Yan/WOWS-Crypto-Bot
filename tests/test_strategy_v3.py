@@ -37,7 +37,6 @@ class TestWowsStrategyV3(unittest.TestCase):
         self.assertEqual(self.strategy.RISK_FRACTION_PER_TRADE, 0.015)
 
     def test_rolling_high_zero_lookahead_bias(self):
-        # Create synthetic 4H DataFrame
         dates = pd.date_range("2024-01-01", periods=100, freq="4h")
         highs = np.linspace(100, 200, 100)
         df = pd.DataFrame({
@@ -52,17 +51,12 @@ class TestWowsStrategyV3(unittest.TestCase):
         analyzed = self.strategy.populate_indicators(df, {"pair": "SOL/USDT"})
         self.assertIn("rolling_high_42", analyzed.columns)
         
-        # Verify rolling_high_42 at index i is max of highs up to index i-1, NOT including index i
         for idx in range(50, 100):
             expected_max = df["high"].iloc[idx-42:idx].max()
             actual_val = analyzed["rolling_high_42"].iloc[idx]
             self.assertAlmostEqual(expected_max, actual_val, places=4)
 
     def test_tactical_sleeve_stake_sizing(self):
-        # On $3,000 equity:
-        # risk_budget = 3000 * 0.015 = $45.00
-        # risk_stake = 45 / 0.070 = 642.86
-        # position_cap = 3000 * 0.25 = $750.00
         stake = self.strategy.custom_stake_amount(
             pair="SOL/USDT",
             current_time=datetime.now(timezone.utc),
@@ -99,34 +93,33 @@ class TestWowsStrategyV3(unittest.TestCase):
         trade = DummyTrade()
         now = datetime.now(timezone.utc)
 
-        # 1. Under +5.0% profit: return None (initial -7.0% stop stays intact)
-        stop_sub5 = self.strategy.custom_stoploss(
+        # 1. Under +12.0% profit: return None (let macro trend expand without early choke)
+        stop_sub12 = self.strategy.custom_stoploss(
             pair="SOL/USDT",
             trade=trade,
             current_time=now,
-            current_rate=103.0,
-            current_profit=0.03,
+            current_rate=108.0,
+            current_profit=0.08,
             after_fill=False
         )
-        self.assertIsNone(stop_sub5)
+        self.assertIsNone(stop_sub12)
 
-        # 2. At +6.0% profit: breakeven lock kicks in at least +1.5%
-        stop_profit6 = self.strategy.custom_stoploss(
+        # 2. At +15.0% profit: wide trailing stop engages
+        stop_profit15 = self.strategy.custom_stoploss(
             pair="SOL/USDT",
             trade=trade,
             current_time=now,
-            current_rate=106.0,
-            current_profit=0.06,
+            current_rate=115.0,
+            current_profit=0.15,
             after_fill=False
         )
-        self.assertIsNotNone(stop_profit6)
-        # Stop should be tightened closer than -6.0%
-        self.assertGreater(stop_profit6, -0.06)
+        self.assertIsNotNone(stop_profit15)
+        self.assertGreater(stop_profit15, -0.15)
 
-    def test_populate_exit_trend_on_ema50_breakdown(self):
+    def test_populate_exit_trend_on_channel_breakdown(self):
         df = pd.DataFrame({
             "close": [95.0, 90.0],
-            "ema50": [100.0, 100.0],
+            "rolling_low_21": [100.0, 100.0],
             "volume": [100.0, 100.0]
         })
         exit_df = self.strategy.populate_exit_trend(df, {"pair": "SOL/USDT"})
