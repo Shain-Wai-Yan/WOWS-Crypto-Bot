@@ -13,5 +13,5 @@ services:
       - PYTHONUNBUFFERED=1
     command: >
       trade
-      --config /freqtrade/config.json
-      --strategy WowsStrategy
+      --config /freqtrade/user_data/config-tactical-v3.json
+      --strategy WowsStrategyV3
