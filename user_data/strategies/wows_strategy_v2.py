@@ -109,6 +109,8 @@ class WowsStrategyV2(IStrategy):
     process_only_new_candles = True
     startup_candle_count = 200  # Required for 200 EMA warm-up
     can_short = False
+    enable_trend_pullback: bool = True
+    enable_breakout: bool = True
 
     # Risk & Protective Exits (managed via Freqtrade engine + custom callbacks)
     stoploss = -0.04  # -4.0% Hard Initial Stop
@@ -149,6 +151,10 @@ class WowsStrategyV2(IStrategy):
 
         self.wows_base_url = os.getenv("WOWS_BASE_URL", "http://localhost:3000")
         self.bot_api_key = os.getenv("BOT_API_KEY", "")
+
+        strat_cfg = self.config.get("wows_strategy", {})
+        self.enable_trend_pullback = strat_cfg.get("enable_trend_pullback", getattr(self, "enable_trend_pullback", True))
+        self.enable_breakout = strat_cfg.get("enable_breakout", getattr(self, "enable_breakout", True))
 
         # Initialize durable subcomponents
         self.outbox = OutboxManager(self.outbox_db_path)
@@ -375,11 +381,13 @@ class WowsStrategyV2(IStrategy):
         )
 
         # Apply signals and tags (Breakout prioritized if both trigger simultaneously)
-        dataframe.loc[cond_pullback, "enter_long"] = 1
-        dataframe.loc[cond_pullback, "enter_tag"] = "trend_pullback"
+        if self.enable_trend_pullback:
+            dataframe.loc[cond_pullback, "enter_long"] = 1
+            dataframe.loc[cond_pullback, "enter_tag"] = "trend_pullback"
 
-        dataframe.loc[cond_breakout, "enter_long"] = 1
-        dataframe.loc[cond_breakout, "enter_tag"] = "breakout"
+        if self.enable_breakout:
+            dataframe.loc[cond_breakout, "enter_long"] = 1
+            dataframe.loc[cond_breakout, "enter_tag"] = "breakout"
 
         return dataframe
 

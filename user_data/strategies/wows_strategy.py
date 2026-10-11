@@ -26,7 +26,7 @@ logger = logging.getLogger("WowsStrategy")
 
 class WowsStrategy(IStrategy):
     """
-    Production-ready Freqtrade Strategy for WOWS Paper Trading.
+    Production-ready Freqtrade Strategy for WOWS Paper Trading (Baseline Control).
     Invariants:
     1. Strictly dry_run = True.
     2. Signals evaluated strictly on completed closed candle bars.
@@ -34,6 +34,7 @@ class WowsStrategy(IStrategy):
     4. Two-tier risk guards with monotonic bar cooldowns.
     5. Non-blocking outbox worker and 60-second telemetry heartbeats.
     6. Startup reconciliation parity check before enabling entries.
+    7. Clean research/backtest isolation: zero external network calls during backtesting.
     """
     INTERFACE_VERSION = 3
 
@@ -62,8 +63,24 @@ class WowsStrategy(IStrategy):
 
         self._reconciliation_passed = False
 
+    def is_research_mode(self) -> bool:
+        """Returns True if running in Backtest or Hyperopt mode."""
+        try:
+            from freqtrade.enums import RunMode
+            runmode = self.config.get("runmode")
+            if runmode in (RunMode.BACKTEST, RunMode.HYPEROPT):
+                return True
+        except ImportError:
+            pass
+        return str(self.config.get("runmode", "")).lower() in ("backtest", "hyperopt")
+
     def bot_start(self, **kwargs) -> None:
         """Freqtrade lifecycle hook: runs once when bot starts."""
+        if self.is_research_mode():
+            logger.info("WowsStrategy running in research/backtest mode: live network services bypassed.")
+            self._reconciliation_passed = True
+            return
+
         logger.info("Initializing WOWS Crypto Bot...")
         # Start background workers
         self.dispatcher.start()
@@ -105,8 +122,10 @@ class WowsStrategy(IStrategy):
 
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
         """Runs each iteration of the bot loop."""
+        if self.is_research_mode():
+            return
+
         # Memory optimization for 512MB RAM containers:
-        # Periodic garbage collection and glibc malloc_trim to return free memory to Linux
         self._loop_count = getattr(self, "_loop_count", 0) + 1
         if self._loop_count % 12 == 0:
             import gc
@@ -140,17 +159,11 @@ class WowsStrategy(IStrategy):
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        pair = metadata["pair"]
-        now_ms = int(time.time() * 1000)
-
-        # Pre-trade guard check: can this pair enter?
-        can_enter, reason, is_halt = self.guards.check_entry_allowed(pair, now_ms, 50000.0)
-        if not can_enter or not self._reconciliation_passed:
-            dataframe["enter_long"] = 0
-            if reason:
-                self.telemetry.log_event("guard_blocked", "info", f"Entry suppressed on {pair}: {reason}")
-            return dataframe
-
+        """
+        Vectorized, stateless candidate signal generation.
+        Pure baseline RSI mean-reversion setup: RSI < 30 and Close > EMA20.
+        """
+        dataframe["enter_long"] = 0
         dataframe.loc[
             (
                 (dataframe["rsi"] < 30) &
@@ -161,8 +174,39 @@ class WowsStrategy(IStrategy):
         ] = 1
         return dataframe
 
+    def confirm_trade_entry(
+        self,
+        pair: str,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        current_time: datetime,
+        entry_tag: Optional[str],
+        **kwargs
+    ) -> bool:
+        """
+        Freqtrade dynamic pre-trade gate.
+        Evaluates reconciliation and guards trade-by-trade immediately before order placement.
+        """
+        # In live/dry-run mode, require healthy startup reconciliation
+        if not self.is_research_mode() and not self._reconciliation_passed:
+            logger.warning(f"Rejecting entry on {pair}: Startup reconciliation not passed.")
+            return False
+
+        # Chronological RiskGuards check
+        timestamp_ms = int(current_time.timestamp() * 1000)
+        can_enter, reason, is_halt = self.guards.check_entry_allowed(pair, timestamp_ms, 50000.0)
+        if not can_enter:
+            if not self.is_research_mode() and reason:
+                self.telemetry.log_event("guard_blocked", "info", f"Entry suppressed on {pair}: {reason}")
+            logger.info(f"Entry suppressed on {pair} at {current_time}: {reason}")
+            return False
+
+        return True
+
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # Exit trend: RSI overbought
+        dataframe["exit_long"] = 0
         dataframe.loc[
             (
                 (dataframe["rsi"] > 70) &
@@ -192,35 +236,33 @@ class WowsStrategy(IStrategy):
         filled_at = order.order_filled_utc or current_time
         timestamp_ms = int(filled_at.timestamp() * 1000)
 
-        payload = {
-            "botId": self.bot_id,
-            "tradeId": trade.id,
-            "orderId": order_id,
-            "eventType": event_type,
-            "isEntry": is_entry,
-            "pair": pair,
-            "side": order.ft_order_side,
-            "filledAmount": filled_amount,
-            "fillPrice": fill_price,
-            "cost": filled_cost,
-            "timestamp": timestamp_ms,
-            "strategy": self.__class__.__name__,
-            "tag": getattr(trade, "enter_tag", None) if is_entry else getattr(trade, "exit_reason", None),
-        }
-
-        # Thread-safe outbox insert (< 1ms, zero network latency on strategy loop)
-        self.outbox.record_fill(event_id, payload)
-        logger.info(f"Recorded {event_type} fill for {pair} ({order_id}) in durable outbox.")
-
-        # Update guard state on exits
+        # Update guard state on exits across all run modes
         if not is_entry:
             profit_abs = getattr(trade, "close_profit_abs", 0.0) or 0.0
             self.guards.on_trade_closed(pair, float(profit_abs), timestamp_ms)
 
-        # Log telemetry event
-        self.telemetry.log_event(
-            "order_filled",
-            "info",
-            f"Filled {order.ft_order_side} {filled_amount} {pair} @ {fill_price}",
-            {"tradeId": trade.id, "orderId": order_id},
-        )
+        # External outbox and telemetry commits run strictly in live/dry-run mode
+        if not self.is_research_mode():
+            payload = {
+                "botId": self.bot_id,
+                "tradeId": trade.id,
+                "orderId": order_id,
+                "eventType": event_type,
+                "isEntry": is_entry,
+                "pair": pair,
+                "side": order.ft_order_side,
+                "filledAmount": filled_amount,
+                "fillPrice": fill_price,
+                "cost": filled_cost,
+                "timestamp": timestamp_ms,
+                "strategy": self.__class__.__name__,
+                "tag": getattr(trade, "enter_tag", None) if is_entry else getattr(trade, "exit_reason", None),
+            }
+            self.outbox.record_fill(event_id, payload)
+            logger.info(f"Recorded {event_type} fill for {pair} ({order_id}) in durable outbox.")
+            self.telemetry.log_event(
+                "order_filled",
+                "info",
+                f"Filled {order.ft_order_side} {filled_amount} {pair} @ {fill_price}",
+                {"tradeId": trade.id, "orderId": order_id},
+            )

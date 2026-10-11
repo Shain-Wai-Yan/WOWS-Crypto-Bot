@@ -478,5 +478,45 @@ class TestWowsStrategyV2(unittest.TestCase):
         self.assertEqual(payload["fillPrice"], 152.0)
 
 
+
+    def test_ablation_switches(self):
+        """Tests that enable_trend_pullback and enable_breakout correctly gate signals."""
+        import pandas as pd
+        data = {
+            "close": [100.0] * 49 + [110.0],
+            "low": [98.0] * 49 + [104.0],
+            "ema20": [102.0] * 49 + [105.0],
+            "ema50": [95.0] * 50,
+            "ema200": [90.0] * 50,
+            "btc_close_4h": [65000.0] * 50,
+            "btc_ema50_4h": [60000.0] * 50,
+            "rsi": [50.0] * 49 + [45.0],
+            "volume": [500.0] * 49 + [2000.0],
+            "volume_mean_20": [1000.0] * 50,
+            "rolling_high_20": [150.0] * 50,
+        }
+        df = pd.DataFrame(data)
+
+        # With pullback enabled
+        self.strategy.enable_trend_pullback = True
+        self.strategy.enable_breakout = False
+        res = self.strategy.populate_entry_trend(df.copy(), {"pair": "SOL/USDT"})
+        self.assertEqual(res.loc[res.index[-1], "enter_long"], 1)
+        self.assertEqual(res.loc[res.index[-1], "enter_tag"], "trend_pullback")
+
+        # With pullback disabled
+        self.strategy.enable_trend_pullback = False
+        self.strategy.enable_breakout = False
+        res2 = self.strategy.populate_entry_trend(df.copy(), {"pair": "SOL/USDT"})
+        self.assertEqual(res2.loc[res2.index[-1], "enter_long"], 0)
+
+    def test_baseline_research_mode_isolation(self):
+        """Tests that WowsStrategy in research mode bypasses live workers."""
+        from user_data.strategies.wows_strategy import WowsStrategy
+        strat = WowsStrategy({"runmode": "backtest"})
+        self.assertTrue(strat.is_research_mode())
+        strat.bot_start()
+        self.assertTrue(strat._reconciliation_passed)
+
 if __name__ == "__main__":
     unittest.main()
