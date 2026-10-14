@@ -160,3 +160,6 @@ class ReconciliationClient:
             wows_positions=list(wows_pos_map.values()),
             discrepancy_reason=None,
         )
+
+    # Backward compatibility alias
+    reconcile_positions = reconcile

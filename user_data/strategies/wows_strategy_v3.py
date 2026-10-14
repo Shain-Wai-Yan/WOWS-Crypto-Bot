@@ -183,13 +183,14 @@ class WowsStrategyV3(IStrategy):
         try:
             self.dispatcher.start()
             self.telemetry.start()
-            recon_res = self.reconciliation.reconcile_positions([])
-            if recon_res.get("status") in ("in_sync", "reconciled", "ok"):
+            report = self.reconciliation.reconcile([])
+            if getattr(report, "can_trade", False) or getattr(report, "in_sync", False):
                 self._reconciliation_passed = True
                 logger.info("Startup reconciliation successfully passed.")
             else:
                 self._reconciliation_passed = False
-                logger.warning(f"Startup reconciliation pending/failed: {recon_res}")
+                reason = getattr(report, "discrepancy_reason", "Not in sync")
+                logger.warning(f"Startup reconciliation pending/failed: {reason}")
         except Exception as e:
             logger.error(f"Error during bot_start initialization: {e}")
             self._reconciliation_passed = False

@@ -148,5 +148,31 @@ class TestWowsStrategyV3(unittest.TestCase):
         self.assertEqual(exit_df["exit_long"].iloc[1], 1)
 
 
+    def test_bot_start_reconciliation(self):
+        from unittest.mock import MagicMock
+        from reconciliation import ReconciliationReport
+
+        mock_recon = MagicMock()
+        mock_recon.reconcile.return_value = ReconciliationReport(
+            in_sync=True,
+            can_trade=True,
+            status="running",
+            cash=3000.0,
+            total_equity=3000.0,
+            current_exposure=0.0,
+            max_exposure=3000.0,
+            quarantine_count=0,
+            wows_positions=[]
+        )
+        self.strategy.config["runmode"] = "dry_run"
+        self.strategy.reconciliation = mock_recon
+        self.strategy.dispatcher = MagicMock()
+        self.strategy.telemetry = MagicMock()
+
+        self.strategy.bot_start()
+        self.assertTrue(self.strategy._reconciliation_passed)
+        mock_recon.reconcile.assert_called_once_with([])
+
+
 if __name__ == "__main__":
     unittest.main()
