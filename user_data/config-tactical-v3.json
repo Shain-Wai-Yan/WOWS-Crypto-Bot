@@ -47,5 +47,6 @@
     "wows_strategy": {
         "enable_trend_pullback": false,
         "enable_breakout": true
-    }
+    },
+    "initial_state": "running"
 }
