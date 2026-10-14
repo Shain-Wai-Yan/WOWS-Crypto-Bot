@@ -1,21 +1,25 @@
 """
-WOWS Crypto Bot v3: 4H Macro Trend Following (WowsStrategyV3)
-=============================================================
+WOWS Crypto Bot v3 (Upgraded V4 Quantitative Architecture)
+==========================================================
 Option C Tactical Sleeve Implementation (Dedicated $3,000 Portfolio):
-1. 4-Hour Base Timeframe with 1-Day Macro BTC Trend Filter.
-2. 42-period Donchian Rolling High (7 days of consolidation on 4h).
-3. Zero lookahead bias: rolling highs strictly shifted by 1 candle (shift(1)).
-4. Macro Trend Structure: 4h EMA 50 > EMA 200 AND 1d BTC close > 1d BTC EMA 50.
-5. Asymmetric Wide Trend Exits (Letting Winners Run):
-   - Initial Stoploss: -7.0% hard stop.
-   - Breakeven Lock: Ratchet stop to +1.5% (covers all fees) once trade reaches +5.0%.
-   - Dynamic Trailing Stop: 2.5 * ATR(14) below current rate for multi-week expansion.
-   - Macro Trend Exit: Closed 4h candle below 4h EMA 50 (populate_exit_trend).
-6. Tactical Sleeve Sizing & Risk Sandbox:
-   - RISK_FRACTION_PER_TRADE = 0.015 (1.5% equity risk per trade = $45 on $3k).
-   - STOP_DISTANCE_FRACTION = 0.070 (7.0% protective stop distance).
-   - MAX_POSITION_EQUITY_RATIO = 0.25 (25% position cap = $750 max stake per trade).
-7. Full WOWS Integration: OutboxManager, DispatcherWorker, Reconciliation, Telemetry, RiskGuards.
+1. 4-Hour Base Timeframe with 1-Day Macro BTC Trend Filter & 4H BTC Relative Strength.
+2. Cross-Sectional Relative Strength Filter:
+   - Requires altcoin 14-day (42-bar on 4h) ROC > (BTC ROC + 2.0%).
+   - Only trades market leaders actively outpacing Bitcoin.
+3. Volatility Keltner Channel Breakout:
+   - Keltner Upper Band = EMA 20 + 1.8 * ATR(14).
+   - Entry when 4h close expands above Keltner Upper Band on volume > 1.2x 20 EMA.
+   - Requires 4h EMA 50 > EMA 200 AND 1d BTC close > 1d BTC EMA 50.
+4. True Chandelier Trailing Exit:
+   - Initial Stoploss: -6.0% hard stop.
+   - Breakeven Lock: Ratchet stop to +0.5% above entry once trade reaches +4.0%.
+   - Chandelier Trailing Stop: Anchored to trade.max_rate * (1.0 - 3.0 * ATR) for winners above +6.0%.
+   - Trend Exit: Closed 4h candle below 4h EMA 50.
+5. Tactical Sleeve Sizing & Risk Sandbox:
+   - RISK_FRACTION_PER_TRADE = 0.015 (1.5% risk = $45 on $3k).
+   - STOP_DISTANCE_FRACTION = 0.060 (6.0% initial stop distance).
+   - MAX_POSITION_EQUITY_RATIO = 0.25 ($750 max stake per trade, max 4 open positions).
+6. Full WOWS Integration: OutboxManager, DispatcherWorker, Reconciliation, Telemetry, RiskGuards.
 """
 
 # pyright: reportMissingImports=false
@@ -29,7 +33,13 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
 try:
-    from freqtrade.strategy import IStrategy, informative, merge_informative_pair, stoploss_from_open  # type: ignore
+    from freqtrade.strategy import (  # type: ignore
+        IStrategy,
+        informative,
+        merge_informative_pair,
+        stoploss_from_open,
+        stoploss_from_absolute,
+    )
     from freqtrade.persistence import Trade, Order  # type: ignore
 except ImportError:
     class IStrategy:  # type: ignore
@@ -38,7 +48,7 @@ except ImportError:
             self.dp = None
             self.wallets = None
     class Trade:  # type: ignore
-        pass
+        max_rate: float = 0.0
     class Order:  # type: ignore
         pass
     def informative(timeframe: str, asset: str = ""):  # type: ignore
@@ -56,6 +66,13 @@ except ImportError:
         else:
             stoploss = 1 - ((1 + open_relative_stop / leverage) / (1 + _current_profit))
         return max(stoploss * leverage, 0.0)
+    def stoploss_from_absolute(stop_rate: float, current_rate: float, is_short: bool = False, leverage: float = 1.0) -> float:  # type: ignore
+        if current_rate <= 0:
+            return 1.0
+        stoploss = 1 - (stop_rate / current_rate)
+        if is_short:
+            stoploss = -stoploss
+        return max(min(stoploss, 1.0), 0.0) * leverage
 
 try:
     from pandas import DataFrame, Series  # type: ignore
@@ -85,7 +102,7 @@ logger = logging.getLogger(__name__)
 
 class WowsStrategyV3(IStrategy):
     """
-    WOWS Crypto Bot v3 Strategy Class (Option C 4H Macro Trend Following).
+    WOWS Crypto Bot v3 Strategy Class (Option C Upgraded Architecture).
     """
     INTERFACE_VERSION = 3
 
@@ -98,17 +115,17 @@ class WowsStrategyV3(IStrategy):
     enable_breakout: bool = True
 
     # Risk & Protective Exits
-    stoploss = -0.07  # -7.0% Hard Initial Stop
+    stoploss = -0.06  # -6.0% Hard Initial Stop
     use_custom_stoploss = True
 
-    # Minimal ROI: Ceilings only; dynamic trailing stops and trend breakdown manage exits
+    # Minimal ROI: Ceilings only; dynamic Chandelier trailing stops manage exits
     minimal_roi = {
         "0": 1.0  # Uncapped to capture right-tail multi-week macro runners
     }
 
     # Tactical Sleeve Risk Budgeting ($3,000 Sandbox)
     RISK_FRACTION_PER_TRADE = 0.015     # 1.5% equity risked per trade ($45 on $3k)
-    STOP_DISTANCE_FRACTION = 0.070      # 7.0% stop distance -> ~$642 stake
+    STOP_DISTANCE_FRACTION = 0.060      # 6.0% stop distance -> $750 stake
     MAX_POSITION_EQUITY_RATIO = 0.25    # 25% max portfolio allocation ($750 max stake on $3k)
     STAGNATION_HOURS = 240.0            # Exit after 10 days (240h) if trade has zero progress
     STAGNATION_MIN_PROFIT = 0.010       # +1.0% minimum threshold for 10-day stagnation
@@ -183,12 +200,14 @@ class WowsStrategyV3(IStrategy):
 
     def informative_pairs(self) -> List[Tuple[str, str]]:
         stake = self.config.get("stake_currency", "USDT")
-        return [(f"BTC/{stake}", self.inf_timeframe)]
+        return [
+            (f"BTC/{stake}", self.inf_timeframe),  # 1d BTC
+            (f"BTC/{stake}", self.timeframe),      # 4h BTC
+        ]
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
-        Calculates 4H indicators and merges 1D BTC informative trend data.
-        Zero lookahead bias: rolling highs strictly shifted by 1 candle.
+        Calculates 4H indicators, Keltner Channel, and merges 1D & 4H BTC informative trend/ROC data.
         """
         if ta is not None:
             dataframe["ema20"] = ta.EMA(dataframe, timeperiod=20)
@@ -197,11 +216,11 @@ class WowsStrategyV3(IStrategy):
             dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
             dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
             dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
+            dataframe["roc_42"] = ta.ROC(dataframe, timeperiod=42)
         else:
             dataframe["ema20"] = dataframe["close"].ewm(span=20, adjust=False).mean()
             dataframe["ema50"] = dataframe["close"].ewm(span=50, adjust=False).mean()
             dataframe["ema200"] = dataframe["close"].ewm(span=200, adjust=False).mean()
-            # Simple RSI fallback
             delta = dataframe["close"].diff()
             gain = delta.clip(lower=0).rolling(14).mean()
             loss = -delta.clip(upper=0).rolling(14).mean()
@@ -209,67 +228,89 @@ class WowsStrategyV3(IStrategy):
             dataframe["rsi"] = 100 - (100 / (1 + rs))
             dataframe["adx"] = 25.0
             dataframe["atr"] = (dataframe["high"] - dataframe["low"]).rolling(14).mean()
+            dataframe["roc_42"] = ((dataframe["close"] - dataframe["close"].shift(42)) / (dataframe["close"].shift(42) + 1e-9)) * 100
 
         dataframe["volume_mean_20"] = dataframe["volume"].rolling(window=20).mean()
 
-        # Rolling 42-candle high (7 days consolidation on 4h) STRICTLY shifted by 1
-        dataframe["rolling_high_42"] = dataframe["high"].shift(1).rolling(window=42).max()
-        dataframe["rolling_low_21"] = dataframe["low"].shift(1).rolling(window=21).min()
+        # Volatility Keltner Channel Upper Band: EMA 20 + 1.8 * ATR(14)
+        dataframe["keltner_upper"] = dataframe["ema20"] + (1.8 * dataframe["atr"])
 
-        # Merge 1d BTC macro trend filter
+        # Retain rolling 42-candle high for reference/monitoring
+        dataframe["rolling_high_42"] = dataframe["high"].shift(1).rolling(window=42).max()
+
+        # Merge 1d BTC macro trend filter & 4h BTC ROC
         stake = self.config.get("stake_currency", "USDT")
         btc_pair = f"BTC/{stake}"
 
         if hasattr(self, "dp") and self.dp:
             try:
-                inf_df = self.dp.get_pair_dataframe(pair=btc_pair, timeframe=self.inf_timeframe)
-                if inf_df is not None and not inf_df.empty:
+                # 1D BTC Macro Filter
+                inf_1d = self.dp.get_pair_dataframe(pair=btc_pair, timeframe=self.inf_timeframe)
+                if inf_1d is not None and not inf_1d.empty:
                     if ta is not None:
-                        inf_df["ema50"] = ta.EMA(inf_df, timeperiod=50)
+                        inf_1d["ema50"] = ta.EMA(inf_1d, timeperiod=50)
                     else:
-                        inf_df["ema50"] = inf_df["close"].ewm(span=50, adjust=False).mean()
+                        inf_1d["ema50"] = inf_1d["close"].ewm(span=50, adjust=False).mean()
 
-                    inf_df = inf_df.rename(columns={"close": "btc_close_1d", "ema50": "btc_ema50_1d"})
+                    inf_1d = inf_1d.rename(columns={"close": "btc_close_1d", "ema50": "btc_ema50_1d"})
                     dataframe = merge_informative_pair(
-                        dataframe, inf_df[["date", "btc_close_1d", "btc_ema50_1d"]],
+                        dataframe, inf_1d[["date", "btc_close_1d", "btc_ema50_1d"]],
                         self.timeframe, self.inf_timeframe, ffill=True
                     )
-            except Exception as e:
-                logger.warning(f"Could not merge 1d BTC informative data: {e}")
 
-        # Fallback for standalone/mock tests
+                # 4H BTC Relative Strength Filter
+                inf_4h = self.dp.get_pair_dataframe(pair=btc_pair, timeframe=self.timeframe)
+                if inf_4h is not None and not inf_4h.empty:
+                    if ta is not None:
+                        inf_4h["btc_roc_42"] = ta.ROC(inf_4h, timeperiod=42)
+                    else:
+                        inf_4h["btc_roc_42"] = ((inf_4h["close"] - inf_4h["close"].shift(42)) / (inf_4h["close"].shift(42) + 1e-9)) * 100
+                    
+                    dataframe = merge_informative_pair(
+                        dataframe, inf_4h[["date", "btc_roc_42"]],
+                        self.timeframe, self.timeframe, ffill=True
+                    )
+            except Exception as e:
+                logger.warning(f"Could not merge BTC informative data: {e}")
+
+        # Fallbacks for standalone/mock tests
         if "btc_close_1d" not in dataframe.columns or "btc_ema50_1d" not in dataframe.columns:
             dataframe["btc_close_1d"] = 1.0
             dataframe["btc_ema50_1d"] = 0.5
+        if "btc_roc_42" not in dataframe.columns:
+            dataframe["btc_roc_42"] = 0.0
 
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
-        Purely vectorized, stateless calculation of candidate entry signals for 4H Macro Breakouts.
+        Keltner Volatility Squeeze Breakout + Cross-Sectional Relative Strength vs BTC.
         """
         dataframe["enter_long"] = 0
         dataframe["enter_tag"] = None
 
-        # 1. Macro trend alignment: 4H EMA 50 > EMA 200 AND Daily BTC Close > Daily BTC EMA 50
+        # 1. Macro Trend Alignment: 4H EMA 50 > EMA 200 AND Daily BTC Close > Daily BTC EMA 50
         uptrend_structure = dataframe["ema50"] > dataframe["ema200"]
         btc_filter = dataframe["btc_close_1d"] > dataframe["btc_ema50_1d"]
         positive_volume = dataframe["volume"] > 0
 
-        # 2. 4H Donchian Macro Breakout: Close > 42-period rolling high (7 days)
-        rolling_high = dataframe.get("rolling_high_42", dataframe["close"])
-        breakout_trigger = dataframe["close"] > rolling_high
+        # 2. Volatility Keltner Breakout: Close > EMA 20 + 1.8 * ATR
+        keltner_trigger = dataframe["close"] > dataframe["keltner_upper"]
 
-        # 3. Filters: ADX > 20.0, RSI 48-72, Volume expansion > 1.2x 20 EMA
+        # 3. Cross-Sectional Relative Strength vs BTC: Altcoin must outperform BTC by >= +2.0% over 7 days
+        relative_strength = dataframe["roc_42"] > (dataframe["btc_roc_42"] + 2.0)
+
+        # 4. Momentum Velocity & Volume Expansion
         adx_filter = (dataframe["adx"] > 20.0) if "adx" in dataframe.columns else Series(True, index=dataframe.index)
-        rsi_filter = (dataframe["rsi"] >= 48.0) & (dataframe["rsi"] <= 72.0)
+        rsi_filter = (dataframe["rsi"] >= 50.0) & (dataframe["rsi"] <= 72.0)
         volume_filter = dataframe["volume"] > (1.2 * dataframe["volume_mean_20"])
 
         cond_breakout = (
             uptrend_structure &
             btc_filter &
             positive_volume &
-            breakout_trigger &
+            keltner_trigger &
+            relative_strength &
             adx_filter &
             rsi_filter &
             volume_filter
@@ -277,7 +318,7 @@ class WowsStrategyV3(IStrategy):
 
         if self.enable_breakout:
             dataframe.loc[cond_breakout, "enter_long"] = 1
-            dataframe.loc[cond_breakout, "enter_tag"] = "macro_breakout"
+            dataframe.loc[cond_breakout, "enter_tag"] = "keltner_breakout"
 
         return dataframe
 
@@ -313,12 +354,11 @@ class WowsStrategyV3(IStrategy):
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
-        Macro Turtle Exit: Closed 4h candle below 21-period low (channel exit).
+        Macro Trend Exit: Closed 4h candle below 4h EMA 50.
         """
         dataframe["exit_long"] = 0
-        rolling_low = dataframe.get("rolling_low_21", dataframe["close"])
         trend_breakdown = (
-            (dataframe["close"] < rolling_low) &
+            (dataframe["close"] < dataframe["ema50"]) &
             (dataframe["volume"] > 0)
         )
         dataframe.loc[trend_breakdown, "exit_long"] = 1
@@ -355,31 +395,40 @@ class WowsStrategyV3(IStrategy):
         **kwargs
     ) -> Optional[float]:
         """
-        Asymmetric 4H Dynamic Trailing Stop:
-        1. Below +5.0% profit: Initial -7.0% protective stop handles noise.
-        2. Once profit touches +5.0%:
-           - Ratchet stop to +1.5% above entry (locks in fee-free trade).
-           - Trail at 2.5 * ATR(14) below current rate as profit expands into multi-week runs.
+        True Chandelier Trailing Stop:
+        1. Below +4.0% profit: Initial -6.0% hard stop handles normal 4h noise.
+        2. Once current_profit >= +4.0%: Ratchet stop to +0.5% above entry (fee-free lock).
+        3. For trailing winners above +6.0%: Calculate Chandelier stop anchored to trade.max_rate:
+           chandelier_stop_price = trade.max_rate * (1.0 - 3.0 * atr_pct)
+           Converted via stoploss_from_absolute().
         """
-        # Allow true macro runners: only trail wide 3.5*ATR after +12% profit
-        if current_profit < 0.12:
+        if current_profit < 0.040:
             return None
 
-        be_stop = stoploss_from_open(0.05, current_profit)
-        atr_pct = 0.03
-        if hasattr(self, "dp") and self.dp:
-            try:
-                analyzed_df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-                if analyzed_df is not None and not analyzed_df.empty and "atr" in analyzed_df.columns:
-                    last_atr = float(analyzed_df["atr"].iloc[-1])
-                    if current_rate > 0 and last_atr > 0:
-                        atr_pct = last_atr / current_rate
-            except Exception:
-                pass
+        # Lock in at least +0.5% above entry price once trade reaches +4.0%
+        be_stop = stoploss_from_open(0.005, current_profit)
 
-        atr_dist = max(0.05, min(0.15, 3.5 * atr_pct))
-        chosen_dist = min(be_stop, atr_dist)
-        return -chosen_dist
+        # For runners above +6.0%, anchor trailing stop to trade.max_rate (True Chandelier Exit)
+        if current_profit >= 0.060:
+            atr_pct = 0.03  # Fallback 3.0%
+            if hasattr(self, "dp") and self.dp:
+                try:
+                    analyzed_df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+                    if analyzed_df is not None and not analyzed_df.empty and "atr" in analyzed_df.columns:
+                        last_atr = float(analyzed_df["atr"].iloc[-1])
+                        if current_rate > 0 and last_atr > 0:
+                            atr_pct = last_atr / current_rate
+                except Exception:
+                    pass
+
+            max_rate = getattr(trade, "max_rate", current_rate) or current_rate
+            chandelier_stop_price = max_rate * (1.0 - 3.0 * atr_pct)
+            chandelier_stop = stoploss_from_absolute(chandelier_stop_price, current_rate, is_short=False, leverage=1.0)
+
+            chosen_dist = min(be_stop, chandelier_stop)
+            return -chosen_dist
+
+        return -be_stop
 
     def custom_stake_amount(
         self,
@@ -396,7 +445,7 @@ class WowsStrategyV3(IStrategy):
     ) -> float:
         """
         Tactical Sleeve mathematical risk sizing ($3,000 Sandbox):
-        Stake = min((Total_Equity * 0.015) / 0.070, Total_Equity * 0.25, Available_Cash)
+        Stake = min((Total_Equity * 0.015) / 0.060, Total_Equity * 0.25, Available_Cash)
         """
         total_equity = self._get_current_equity()
         if total_equity <= 0:
@@ -404,7 +453,7 @@ class WowsStrategyV3(IStrategy):
             return 0.0
 
         risk_budget = total_equity * self.RISK_FRACTION_PER_TRADE  # e.g., $3,000 * 0.015 = $45.00
-        risk_based_stake = risk_budget / self.STOP_DISTANCE_FRACTION  # e.g., $45.00 / 0.070 = $642.86
+        risk_based_stake = risk_budget / self.STOP_DISTANCE_FRACTION  # e.g., $45.00 / 0.060 = $750.00
         position_cap = total_equity * self.MAX_POSITION_EQUITY_RATIO  # e.g., $3,000 * 0.25 = $750.00
 
         available_balance = max_stake if max_stake > 0 else proposed_stake
