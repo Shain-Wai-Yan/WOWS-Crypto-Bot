@@ -132,7 +132,7 @@ class WowsStrategyV3(IStrategy):
 
     def __init__(self, config: dict) -> None:
         super().__init__(config)
-        self.bot_id = os.getenv("BOT_ID", "freqtrade-tactical-v3")
+        self.bot_id = os.getenv("BOT_ID", "freqtrade-alpha-1")
         
         db_env = os.getenv("SQLITE_DB_PATH")
         if db_env:

@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy configuration and strategy files
 COPY config.json /freqtrade/config.json
+COPY user_data/config-tactical-v3.json /freqtrade/config-tactical-v3.json
 COPY user_data/strategies/ /freqtrade/strategies/
 COPY user_data/ /freqtrade/user_data/
 
@@ -22,4 +23,4 @@ EXPOSE 8080
 
 VOLUME ["/freqtrade/user_data"]
 
-CMD ["trade", "--config", "/freqtrade/user_data/config-tactical-v3.json", "--strategy-path", "/freqtrade/strategies", "--strategy", "WowsStrategyV3"]
+CMD ["trade", "--config", "/freqtrade/config-tactical-v3.json", "--strategy-path", "/freqtrade/strategies", "--strategy", "WowsStrategyV3"]
