@@ -239,6 +239,33 @@ class WowsStrategyV2(IStrategy):
             except Exception:
                 pass
 
+        # Retry reconciliation if blocked & refresh telemetry state
+        try:
+            open_trades = Trade.get_open_trades()
+            local_trades = [{"pair": t.pair, "amount": t.amount} for t in open_trades]
+            if not self._reconciliation_passed:
+                report = self.reconciliation.reconcile(local_trades)
+                if report.can_trade:
+                    self._reconciliation_passed = True
+                    logger.info("Periodic reconciliation check passed: trading unlocked.")
+
+            exposure = sum(float(t.stake_amount) for t in open_trades)
+            status_str = "running" if (self._reconciliation_passed and not self.guards.is_halted) else (
+                "halted" if self.guards.is_halted else "attention_required"
+            )
+            self.telemetry.update_state(
+                status=status_str,
+                active_pairs=self.dp.current_whitelist() if hasattr(self, "dp") and self.dp else [],
+                open_trades_count=len(open_trades),
+                current_exposure=exposure,
+                guard_state={
+                    "realizedToday": self.guards.realized_today,
+                    "consecutiveLosses": self.guards.consecutive_losses,
+                },
+            )
+        except Exception:
+            pass
+
     def informative_pairs(self) -> List[Tuple[str, str]]:
         """Defines higher-timeframe informative pair requirements."""
         stake = self.config.get("stake_currency", "USDT")

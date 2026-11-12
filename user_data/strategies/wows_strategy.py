@@ -135,9 +135,16 @@ class WowsStrategy(IStrategy):
                 ctypes.CDLL("libc.so.6").malloc_trim(0)
             except Exception:
                 pass
-        # Update telemetry state snapshot
+        # Update telemetry state snapshot & retry reconciliation if previously blocked
         try:
             open_trades = Trade.get_open_trades()
+            local_trades = [{"pair": t.pair, "amount": t.amount} for t in open_trades]
+            if not self._reconciliation_passed:
+                report = self.reconciliation.reconcile(local_trades)
+                if report.can_trade:
+                    self._reconciliation_passed = True
+                    logger.info("Periodic reconciliation check passed: trading unlocked.")
+
             exposure = sum(float(t.stake_amount) for t in open_trades)
             status_str = "running" if (self._reconciliation_passed and not self.guards.is_halted) else (
                 "halted" if self.guards.is_halted else "attention_required"

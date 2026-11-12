@@ -22,4 +22,4 @@ EXPOSE 8080
 
 VOLUME ["/freqtrade/user_data"]
 
-CMD ["trade", "--config", "/freqtrade/config.json", "--strategy-path", "/freqtrade/strategies", "--strategy", "WowsStrategy"]
+CMD ["trade", "--config", "/freqtrade/user_data/config-tactical-v3.json", "--strategy-path", "/freqtrade/strategies", "--strategy", "WowsStrategyV3"]

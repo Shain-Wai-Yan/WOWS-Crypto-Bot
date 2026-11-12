@@ -169,9 +169,14 @@ class WowsStrategyV3(IStrategy):
         self._reconciliation_passed = False
 
     def is_live_or_dryrun(self) -> bool:
+        if hasattr(self, "dp") and self.dp and hasattr(self.dp, "runmode"):
+            mode_val = getattr(self.dp.runmode, "value", str(self.dp.runmode)).lower()
+            return mode_val in ("live", "dry_run")
         mode = self.config.get("runmode")
-        if mode:
+        if mode is not None:
             mode_str = str(mode).lower()
+            if mode_str in ("backtest", "hyperopt", "plot", "util"):
+                return False
             return "live" in mode_str or "dry_run" in mode_str or "dryrun" in mode_str
         return False
 
@@ -183,7 +188,16 @@ class WowsStrategyV3(IStrategy):
         try:
             self.dispatcher.start()
             self.telemetry.start()
-            report = self.reconciliation.reconcile([])
+            self.dispatcher.process_pending_batch(limit=50)
+
+            local_trades = []
+            try:
+                open_trades = Trade.get_open_trades()
+                local_trades = [{"pair": t.pair, "amount": t.amount} for t in open_trades]
+            except Exception:
+                local_trades = []
+
+            report = self.reconciliation.reconcile(local_trades)
             if getattr(report, "can_trade", False) or getattr(report, "in_sync", False):
                 self._reconciliation_passed = True
                 logger.info("Startup reconciliation successfully passed.")
@@ -191,13 +205,62 @@ class WowsStrategyV3(IStrategy):
                 self._reconciliation_passed = False
                 reason = getattr(report, "discrepancy_reason", "Not in sync")
                 logger.warning(f"Startup reconciliation pending/failed: {reason}")
+                self.telemetry.log_event(
+                    "reconciliation_mismatch",
+                    "error",
+                    f"Startup reconciliation failed: {reason}",
+                )
+
+            status_str = "running" if self._reconciliation_passed else "attention_required"
+            self.telemetry.update_state(
+                status=status_str,
+                active_pairs=self.dp.current_whitelist() if hasattr(self, "dp") and self.dp else [],
+                open_trades_count=len(local_trades),
+                current_exposure=float(getattr(report, "current_exposure", 0.0) or 0.0),
+                guard_state={
+                    "realizedToday": self.guards.realized_today,
+                    "consecutiveLosses": self.guards.consecutive_losses,
+                },
+            )
         except Exception as e:
             logger.error(f"Error during bot_start initialization: {e}")
             self._reconciliation_passed = False
 
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
-        if self.is_live_or_dryrun():
-            self.telemetry.send_heartbeat()
+        if not self.is_live_or_dryrun():
+            return
+
+        try:
+            open_trades = []
+            try:
+                open_trades = Trade.get_open_trades()
+            except Exception:
+                open_trades = []
+            local_trades = [{"pair": t.pair, "amount": t.amount} for t in open_trades]
+
+            if not self._reconciliation_passed:
+                report = self.reconciliation.reconcile(local_trades)
+                if getattr(report, "can_trade", False) or getattr(report, "in_sync", False):
+                    self._reconciliation_passed = True
+                    logger.info("Periodic reconciliation check passed: trading unlocked.")
+
+            exposure = sum(float(getattr(t, "stake_amount", 0.0) or 0.0) for t in open_trades)
+            status_str = "running" if (self._reconciliation_passed and not self.guards.is_halted) else (
+                "halted" if self.guards.is_halted else "attention_required"
+            )
+            self.telemetry.update_state(
+                status=status_str,
+                active_pairs=self.dp.current_whitelist() if hasattr(self, "dp") and self.dp else [],
+                open_trades_count=len(open_trades),
+                current_exposure=exposure,
+                guard_state={
+                    "realizedToday": self.guards.realized_today,
+                    "consecutiveLosses": self.guards.consecutive_losses,
+                },
+            )
+        except Exception:
+            pass
+        self.telemetry.send_heartbeat()
 
     def informative_pairs(self) -> List[Tuple[str, str]]:
         stake = self.config.get("stake_currency", "USDT")
@@ -478,6 +541,7 @@ class WowsStrategyV3(IStrategy):
     def order_filled(self, pair: str, trade: Trade, order: Order, current_time: datetime, **kwargs) -> None:
         filled_amount = float(order.safe_filled or 0)
         fill_price = float(order.safe_price or 0)
+        filled_cost = float(getattr(order, "safe_cost", None) or (filled_amount * fill_price))
         order_id = str(order.order_id or "").strip()
 
         if not order_id or filled_amount <= 0 or fill_price <= 0:
@@ -485,7 +549,7 @@ class WowsStrategyV3(IStrategy):
 
         is_entry = (order.ft_order_side == trade.entry_side)
         event_type = "entry_fill" if is_entry else "exit_fill"
-        event_id = f"bot:{self.bot_id}:{order_id}:{event_type}"
+        event_id = f"{self.bot_id}:{trade.id}:{order_id}:{event_type}"
         filled_at = order.order_filled_utc or current_time
         timestamp_ms = int(filled_at.timestamp() * 1000)
 
@@ -496,19 +560,26 @@ class WowsStrategyV3(IStrategy):
         if self.is_live_or_dryrun():
             payload = {
                 "botId": self.bot_id,
-                "orderId": order_id,
                 "tradeId": trade.id,
+                "orderId": order_id,
+                "eventType": event_type,
+                "isEntry": is_entry,
                 "pair": pair,
                 "side": order.ft_order_side,
-                "price": fill_price,
-                "amount": filled_amount,
-                "cost": filled_amount * fill_price,
+                "filledAmount": filled_amount,
+                "fillPrice": fill_price,
+                "cost": filled_cost,
                 "timestamp": timestamp_ms,
                 "strategy": self.__class__.__name__,
                 "tag": getattr(trade, "enter_tag", None) if is_entry else getattr(trade, "exit_reason", None),
             }
             self.outbox.record_fill(event_id, payload)
-            self.telemetry.log_event("order_filled", "info", f"Filled {order.ft_order_side} {filled_amount} {pair} @ {fill_price}")
+            self.telemetry.log_event(
+                "order_filled",
+                "info",
+                f"Filled {order.ft_order_side} {filled_amount} {pair} @ {fill_price}",
+                {"tradeId": trade.id, "orderId": order_id, "tag": payload["tag"]},
+            )
 
     def _get_current_equity(self) -> float:
         is_live_trading = not bool(self.config.get("dry_run", True))
