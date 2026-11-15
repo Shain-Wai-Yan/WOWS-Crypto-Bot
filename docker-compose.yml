@@ -7,6 +7,8 @@ services:
       - ./user_data:/freqtrade/user_data
     environment:
       - WOWS_BASE_URL=${WOWS_BASE_URL:-http://host.docker.internal:3000}
+      - WOWS_TELEMETRY_BASE_URL=${WOWS_TELEMETRY_BASE_URL:-}
+      - HEARTBEAT_INTERVAL_SEC=${HEARTBEAT_INTERVAL_SEC:-60}
       - BOT_API_KEY=${BOT_API_KEY}
       - BOT_ID=${BOT_ID:-freqtrade-alpha-1}
       - SQLITE_DB_PATH=/freqtrade/user_data/outbox.db

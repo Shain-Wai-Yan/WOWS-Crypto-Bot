@@ -158,7 +158,7 @@ class WowsStrategyV3(IStrategy):
         self.outbox = OutboxManager(self.outbox_db_path)
         self.dispatcher = DispatcherWorker(self.outbox, self.wows_base_url, self.bot_api_key)
         self.reconciliation = ReconciliationClient(self.wows_base_url, self.bot_api_key, self.bot_id)
-        self.telemetry = TelemetryClient(self.wows_base_url, self.bot_api_key, self.bot_id, interval_sec=60.0)
+        self.telemetry = TelemetryClient(self.wows_base_url, self.bot_api_key, self.bot_id)
         self.guards = RiskGuards(
             max_daily_loss_pct=0.05,      # 5.0% daily drawdown circuit breaker on tactical sleeve
             max_consecutive_losses=3,     # 3 consecutive losses
@@ -260,7 +260,7 @@ class WowsStrategyV3(IStrategy):
             )
         except Exception:
             pass
-        self.telemetry.send_heartbeat()
+        # Background telemetry owns dispatch; the bot loop only updates state.
 
     def informative_pairs(self) -> List[Tuple[str, str]]:
         stake = self.config.get("stake_currency", "USDT")

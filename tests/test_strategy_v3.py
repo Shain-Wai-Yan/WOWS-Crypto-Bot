@@ -173,6 +173,17 @@ class TestWowsStrategyV3(unittest.TestCase):
         self.assertTrue(self.strategy._reconciliation_passed)
         mock_recon.reconcile.assert_called_once_with([])
 
+    def test_bot_loop_updates_telemetry_without_dispatching_an_extra_heartbeat(self):
+        from unittest.mock import MagicMock
+
+        self.strategy.config["runmode"] = "dry_run"
+        self.strategy._reconciliation_passed = True
+        self.strategy.telemetry = MagicMock()
+        for _ in range(6):
+            self.strategy.bot_loop_start(datetime.now(timezone.utc))
+        self.assertEqual(self.strategy.telemetry.update_state.call_count, 6)
+        self.strategy.telemetry.send_heartbeat.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

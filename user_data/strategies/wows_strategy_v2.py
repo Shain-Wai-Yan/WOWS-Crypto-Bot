@@ -151,7 +151,7 @@ class WowsStrategyV2(IStrategy):
         self.outbox = OutboxManager(self.outbox_db_path)
         self.dispatcher = DispatcherWorker(self.outbox, self.wows_base_url, self.bot_api_key)
         self.reconciliation = ReconciliationClient(self.wows_base_url, self.bot_api_key, self.bot_id)
-        self.telemetry = TelemetryClient(self.wows_base_url, self.bot_api_key, self.bot_id, interval_sec=60.0)
+        self.telemetry = TelemetryClient(self.wows_base_url, self.bot_api_key, self.bot_id)
         self.guards = RiskGuards(
             max_daily_loss_pct=0.03,      # 3.0% daily drawdown circuit breaker
             max_consecutive_losses=3,     # 3 consecutive losses
