@@ -3,7 +3,8 @@ import json
 import sqlite3
 import hashlib
 import time
-from typing import Optional, List, Dict, Any
+from contextlib import contextmanager
+from typing import Optional, List, Dict, Any, Iterator
 
 class ConflictingEventError(Exception):
     """Raised when an event ID already exists with different payload details."""
@@ -21,12 +22,19 @@ class OutboxManager:
             os.makedirs(parent_dir, exist_ok=True)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            with conn:
+                yield conn
+        finally:
+            # sqlite3.Connection.__exit__ only commits/rolls back. Closing here
+            # releases native page caches and descriptors on every polling path.
+            conn.close()
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:

@@ -96,6 +96,7 @@ from dispatcher import DispatcherWorker
 from reconciliation import ReconciliationClient
 from telemetry import TelemetryClient
 from guards import RiskGuards
+from process_metrics import sample_process_memory
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +230,14 @@ class WowsStrategyV3(IStrategy):
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
         if not self.is_live_or_dryrun():
             return
+
+        now = time.monotonic()
+        if now - getattr(self, "_last_memory_sample", float("-inf")) >= 60:
+            self._last_memory_sample = now
+            try:
+                logger.info("Bot resource sample: %s", json.dumps(sample_process_memory(), sort_keys=True))
+            except Exception:
+                logger.debug("Resource sample unavailable", exc_info=True)
 
         try:
             open_trades = []
